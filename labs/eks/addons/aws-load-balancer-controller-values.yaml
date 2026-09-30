@@ -1,0 +1,78 @@
+# Helm values for the AWS Load Balancer Controller on the EKS standard cluster (hub/05 L200 §2.3).
+#
+#   helm repo add eks https://aws.github.io/eks-charts && helm repo update
+#   helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
+#     --version 3.5.0 -n kube-system \
+#     -f labs/eks/addons/aws-load-balancer-controller-values.yaml --set clusterName=shopfront-dev
+#
+# The controller needs an IAM role: eksctl-standard.yaml creates the Pod Identity association for
+# the kube-system/aws-load-balancer-controller ServiceAccount, so the chart must NOT create an IRSA
+# annotation and must reuse that ServiceAccount name. Not needed on EKS Auto Mode (built in).
+clusterName: shopfront-dev
+region: us-east-1
+vpcId: ""                       # discovered from the EC2 metadata of the node when empty; set it on private clusters
+
+replicaCount: 2                 # leader election; the second replica is a warm standby
+podDisruptionBudget:
+  maxUnavailable: 1
+
+serviceAccount:
+  create: true
+  name: aws-load-balancer-controller
+  annotations: {}               # no eks.amazonaws.com/role-arn: Pod Identity provides credentials
+
+# Pods that use the ALB get a readiness gate injected in namespaces labelled
+# elbv2.k8s.aws/pod-readiness-gate-inject=enabled (see manifests/base/namespace.yaml).
+enablePodReadinessGateInject: true
+
+# Every ALB/NLB/target group created by the controller carries these tags (cost allocation, IAM ABAC).
+defaultTags:
+  Project: shopfront
+  ManagedBy: aws-load-balancer-controller
+
+# Shield Advanced and WAF classic integrations are off; WAFv2 is attached per Ingress through the
+# alb.ingress.kubernetes.io/wafv2-acl-arn annotation.
+enableShield: false
+enableWaf: false
+enableWafv2: true
+
+# Default IngressClass so Ingress objects without ingressClassName still get an ALB.
+ingressClass: alb
+createIngressClassResource: true
+ingressClassParams:
+  create: true
+  spec:
+    scheme: internet-facing
+    ipAddressType: ipv4
+    group:
+      name: shopfront
+    loadBalancerAttributes:
+      - key: routing.http.drop_invalid_header_fields.enabled
+        value: "true"
+
+# Mutator webhook off: a Service of type LoadBalancer becomes an NLB only when it opts in with
+# spec.loadBalancerClass: service.k8s.aws/nlb, instead of every new Service being taken over.
+enableServiceMutatorWebhook: false
+serviceMutatorWebhookConfig:
+  defaultTargetType: ip
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+nodeSelector:
+  kubernetes.io/os: linux
+tolerations: []
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: aws-load-balancer-controller
+
+podLabels:
+  app.kubernetes.io/part-of: platform

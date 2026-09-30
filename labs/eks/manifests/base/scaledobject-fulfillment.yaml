@@ -1,0 +1,57 @@
+# KEDA scales fulfillment-worker on SQS backlog (hub/09 L200 §2.3, L300 §2.6).
+#
+# KEDA's operator reads the queue attributes with its own Pod Identity (or IRSA) role; the pods keep
+# their least-privilege consumer role. queueLength is the target number of visible messages per
+# replica: 100 messages and 1 replica -> scale to 2 once 200 are visible, and so on up to maxReplicaCount.
+# activationQueueLength lets KEDA scale to zero when the queue is empty for cooldownPeriod seconds.
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: aws-pod-identity
+  namespace: shopfront
+  labels:
+    app.kubernetes.io/part-of: shopfront
+spec:
+  podIdentity:
+    provider: aws
+    # roleArn: arn:aws:iam::123456789012:role/shopfront-dev-eks-keda-sqs-reader   # assume a narrower role per trigger
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: fulfillment-worker
+  namespace: shopfront
+  labels:
+    app.kubernetes.io/name: fulfillment-worker
+    app.kubernetes.io/part-of: shopfront
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: fulfillment-worker
+  pollingInterval: 15          # seconds between SQS GetQueueAttributes calls
+  cooldownPeriod: 120          # seconds of "inactive" before scaling to minReplicaCount
+  minReplicaCount: 1           # 0 is allowed; the first message then waits ~pollingInterval + pod start
+  maxReplicaCount: 20
+  fallback:                    # if SQS metrics cannot be read, hold this many replicas
+    failureThreshold: 3
+    replicas: 2
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+            - type: Percent
+              value: 50
+              periodSeconds: 60
+  triggers:
+    - type: aws-sqs-queue
+      authenticationRef:
+        name: aws-pod-identity
+      metadata:
+        queueURL: https://sqs.us-east-1.amazonaws.com/123456789012/shopfront-dev-orders-created
+        queueLength: "100"
+        activationQueueLength: "1"
+        awsRegion: us-east-1
+        scaleOnInFlight: "false"   # count visible messages only, not the ones being processed

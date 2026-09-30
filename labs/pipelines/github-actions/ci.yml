@@ -1,0 +1,209 @@
+# CI for the shopfront images: lint -> test -> build multi-arch -> scan -> SBOM + provenance -> sign
+# -> push to ECR, authenticated with GitHub OIDC (no long-lived AWS keys). hub/08 L200 §2.1, L300 §2.6.
+#
+# Copy to .github/workflows/ci.yml. Prerequisites in AWS (once):
+#   - an IAM OIDC provider for https://token.actions.githubusercontent.com
+#   - a role (e.g. shopfront-ci) whose trust policy allows sts:AssumeRoleWithWebIdentity with
+#       "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+#       "token.actions.githubusercontent.com:sub": "repo:ErickrU/containers-on-aws:ref:refs/heads/main"
+#     (pull requests get read-only: a second role bound to "repo:...:pull_request" or no role at all)
+#   - ECR repositories shopfront/{orders,catalog,worker,report-job} (labs/ecs/cloudformation/02-cluster.yaml)
+#
+# Every action is pinned to a commit SHA (comment = tag) so a compromised tag cannot change what runs.
+# Versions resolved on 2026-09-30; bump with Dependabot or `pin-github-action`.
+name: ci
+
+on:
+  push:
+    branches: [main]
+    paths: [labs/apps/**, labs/pipelines/github-actions/ci.yml]
+  pull_request:
+    paths: [labs/apps/**]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  AWS_REGION: us-east-1
+  AWS_ACCOUNT_ID: "123456789012"
+  ECR_REGISTRY: 123456789012.dkr.ecr.us-east-1.amazonaws.com
+  IMAGE_PREFIX: shopfront
+
+jobs:
+  lint-and-test:
+    name: lint and unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: hadolint (Dockerfiles)
+        uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
+        with:
+          recursive: true          # every file named Dockerfile under the repository
+          dockerfile: Dockerfile
+          failure-threshold: warning
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: labs/apps/catalog/go.mod
+          cache-dependency-path: labs/apps/catalog/go.sum
+      - name: catalog tests
+        working-directory: labs/apps/catalog
+        run: go vet ./... && go test -race -count=1 ./...
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: labs/apps/orders/package-lock.json
+      - name: orders tests
+        working-directory: labs/apps/orders
+        run: npm ci && npm test
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: worker and report-job tests
+        run: |
+          python -m pip install --quiet -r labs/apps/worker/requirements.txt -r labs/apps/report-job/requirements.txt pytest
+          python -m pytest -q labs/apps/worker labs/apps/report-job
+
+  build-and-push:
+    name: build ${{ matrix.service }}
+    needs: lint-and-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      id-token: write          # OIDC token for AWS and for keyless cosign
+      security-events: write   # upload Trivy SARIF to code scanning
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [orders, catalog, worker, report-job]
+    env:
+      IMAGE: 123456789012.dkr.ecr.us-east-1.amazonaws.com/shopfront/${{ matrix.service }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # Pull requests only build (no AWS role, no push); main pushes with the OIDC-assumed role.
+      - name: configure AWS credentials (OIDC)
+        if: github.event_name == 'push'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/shopfront-ci
+          role-session-name: gha-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: login to ECR
+        if: github.event_name == 'push'
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+        with:
+          mask-password: "true"
+
+      - name: image metadata (tags and OCI labels)
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=ref,event=branch
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=shopfront/${{ matrix.service }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: build (and push on main) multi-arch with SBOM and provenance attestations
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: labs/apps/${{ matrix.service }}
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name == 'push' }}
+          load: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            REVISION=${{ github.sha }}
+            SOURCE=${{ github.server_url }}/${{ github.repository }}
+          # BuildKit writes SPDX SBOM + SLSA provenance as OCI referrers next to the image index.
+          sbom: true
+          provenance: mode=max
+          # Remote layer cache in ECR: later builds on any runner reuse unchanged layers (hub/02 L300 §2.4).
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
+          cache-to: ${{ github.event_name == 'push' && format('type=registry,ref={0}:buildcache,mode=max,image-manifest=true,oci-mediatypes=true', env.IMAGE) || '' }}
+
+      # Scan what was pushed, by digest, and fail on fixable CRITICAL/HIGH. On pull requests the
+      # image is not pushed, so the scan targets the local build context (filesystem mode).
+      - name: trivy scan (pushed image)
+        if: github.event_name == 'push'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          format: sarif
+          output: trivy-${{ matrix.service }}.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: trivy scan (pull request, filesystem)
+        if: github.event_name == 'pull_request'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: labs/apps/${{ matrix.service }}
+          format: sarif
+          output: trivy-${{ matrix.service }}.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "0"
+      - name: upload scan results
+        if: always()
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          sarif_file: trivy-${{ matrix.service }}.sarif
+          category: trivy-${{ matrix.service }}
+
+      # Keyless signature bound to this workflow's OIDC identity; Kyverno/Gatekeeper verify it at
+      # admission (hub/06 L300 §2.5). AWS Signer + Notation is the AWS-native alternative:
+      #   notation sign --plugin com.amazonaws.signer.notation.plugin --id <signing-profile-arn> $IMAGE@$DIGEST
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        if: github.event_name == 'push'
+      - name: install syft (SBOM generator for the attestation)
+        if: github.event_name == 'push'
+        uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+      - name: sign image and attach SBOM attestation
+        if: github.event_name == 'push'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+          syft "${IMAGE}@${DIGEST}" -o spdx-json > "sbom-${{ matrix.service }}.spdx.json"
+          cosign attest --yes --type spdxjson --predicate "sbom-${{ matrix.service }}.spdx.json" "${IMAGE}@${DIGEST}"
+
+      - name: record the digest for the deploy workflows
+        if: github.event_name == 'push'
+        run: |
+          echo "${{ matrix.service }} ${IMAGE}@${{ steps.build.outputs.digest }}" >> digests.txt
+          cat digests.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: github.event_name == 'push'
+        with:
+          name: digest-${{ matrix.service }}
+          path: digests.txt
+          retention-days: 30

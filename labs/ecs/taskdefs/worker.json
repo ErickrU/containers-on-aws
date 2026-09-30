@@ -1,0 +1,92 @@
+{
+  "family": "shopfront-dev-fulfillment-worker",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "runtimePlatform": { "cpuArchitecture": "ARM64", "operatingSystemFamily": "LINUX" },
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "arn:aws:iam::123456789012:role/shopfront-dev-task-execution",
+  "taskRoleArn": "arn:aws:iam::123456789012:role/shopfront-dev-worker-task",
+  "volumes": [{ "name": "tmp" }],
+  "containerDefinitions": [
+    {
+      "name": "worker",
+      "image": "123456789012.dkr.ecr.us-east-1.amazonaws.com/shopfront/worker@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "command": ["python", "-m", "worker.fulfillment"],
+      "essential": true,
+      "cpu": 192,
+      "memoryReservation": 256,
+      "portMappings": [{ "name": "http", "containerPort": 8082, "protocol": "tcp", "appProtocol": "http" }],
+      "environment": [
+        { "name": "PORT", "value": "8082" },
+        { "name": "AWS_REGION", "value": "us-east-1" },
+        { "name": "SQS_QUEUE_URL", "value": "https://sqs.us-east-1.amazonaws.com/123456789012/shopfront-dev-orders-created" },
+        { "name": "SQS_WAIT_TIME_SECONDS", "value": "20" },
+        { "name": "SQS_MAX_MESSAGES", "value": "10" },
+        { "name": "OTEL_EXPORTER_OTLP_ENDPOINT", "value": "http://127.0.0.1:4318" },
+        { "name": "OTEL_SERVICE_NAME", "value": "fulfillment-worker" },
+        { "name": "OTEL_RESOURCE_ATTRIBUTES", "value": "deployment.environment=dev" },
+        { "name": "SHUTDOWN_TIMEOUT_SECONDS", "value": "20" }
+      ],
+      "secrets": [
+        { "name": "DATABASE_URL", "valueFrom": "arn:aws:secretsmanager:us-east-1:123456789012:secret:shopfront/dev/database-url" }
+      ],
+      "dependsOn": [{ "containerName": "otel-collector", "condition": "HEALTHY" }],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "python -c \"import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8082/healthz', timeout=2).status == 200 else 1)\""],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 30
+      },
+      "stopTimeout": 30,
+      "user": "10001:10001",
+      "readonlyRootFilesystem": true,
+      "linuxParameters": {
+        "initProcessEnabled": true,
+        "capabilities": { "drop": ["ALL"] }
+      },
+      "mountPoints": [{ "sourceVolume": "tmp", "containerPath": "/tmp", "readOnly": false }],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/shopfront/dev/fulfillment-worker",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "ecs",
+          "mode": "non-blocking",
+          "max-buffer-size": "25m"
+        }
+      }
+    },
+    {
+      "name": "otel-collector",
+      "image": "public.ecr.aws/aws-observability/aws-otel-collector:v0.50.0",
+      "essential": false,
+      "cpu": 64,
+      "memoryReservation": 128,
+      "command": ["--config=/etc/ecs/ecs-default-config.yaml"],
+      "healthCheck": {
+        "command": ["CMD", "/healthcheck"],
+        "interval": 10,
+        "timeout": 5,
+        "retries": 5,
+        "startPeriod": 10
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/shopfront/dev/otel",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "worker",
+          "mode": "non-blocking",
+          "max-buffer-size": "10m"
+        }
+      }
+    }
+  ],
+  "tags": [
+    { "key": "Project", "value": "shopfront" },
+    { "key": "Environment", "value": "dev" },
+    { "key": "Service", "value": "fulfillment-worker" }
+  ]
+}

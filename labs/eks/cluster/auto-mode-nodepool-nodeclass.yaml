@@ -1,0 +1,108 @@
+# EKS Auto Mode: a custom NodeClass and NodePool for the shopfront cluster (hub/04 L200 §2.7).
+#
+#   kubectl apply -f labs/eks/cluster/auto-mode-nodepool-nodeclass.yaml
+#   kubectl get nodepools,nodeclasses
+#
+# In Auto Mode the NodeClass API group is eks.amazonaws.com (not karpenter.k8s.aws) and it exposes a
+# smaller, AWS-curated surface: subnets and security groups, ephemeral storage, SNAT policy, network
+# policy mode. There is no AMI selector (always the Auto Mode Bottlerocket AMI), no user data, no
+# kubelet flags and no IMDS settings (hop limit 1 is fixed). NodePools use the standard karpenter.sh/v1
+# API with the same requirements, limits and disruption fields as open-source Karpenter.
+apiVersion: eks.amazonaws.com/v1
+kind: NodeClass
+metadata:
+  name: shopfront
+spec:
+  # Nodes in private subnets tagged by eksctl; the cluster security group is added automatically.
+  subnetSelectorTerms:
+    - tags:
+        kubernetes.io/role/internal-elb: "1"
+        kubernetes.io/cluster/shopfront-dev-auto: "*"
+  securityGroupSelectorTerms:
+    - tags:
+        kubernetes.io/cluster/shopfront-dev-auto: owned
+  # The node role Auto Mode created (or the one you passed as nodeRoleARN).
+  role: eksctl-shopfront-dev-auto-cluster-NodeRole
+  snatPolicy: Random                       # Disabled when pods need their own IP to be visible off-VPC
+  networkPolicy: DefaultAllow              # DefaultDeny turns every namespace into deny-by-default
+  networkPolicyEventLogs: Enabled          # policy decisions to /aws/eks/<cluster>/network-policy
+  ephemeralStorage:
+    size: 80Gi                             # the root volume that /var/lib/containerd and emptyDir use
+    iops: 3000
+    throughput: 125
+  tags:
+    Project: shopfront
+    Environment: dev
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: shopfront-general
+spec:
+  template:
+    metadata:
+      labels:
+        workload: general
+    spec:
+      nodeClassRef:
+        group: eks.amazonaws.com
+        kind: NodeClass
+        name: shopfront
+      requirements:
+        - key: eks.amazonaws.com/instance-category
+          operator: In
+          values: [c, m, r]
+        - key: eks.amazonaws.com/instance-generation
+          operator: Gt
+          values: ["6"]
+        - key: kubernetes.io/arch
+          operator: In
+          values: [arm64]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: [spot, on-demand]
+      expireAfter: 336h                    # 14 days; Auto Mode caps node lifetime at 21 days anyway
+      terminationGracePeriod: 24h
+  limits:
+    cpu: "100"
+    memory: 400Gi
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 1m
+    budgets:
+      - nodes: "20%"
+  weight: 50
+---
+# Pods that must not run on Spot (the Kafka consumer keeps partition assignments; interruptions
+# trigger group rebalances) select this pool through nodeSelector + toleration.
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: shopfront-on-demand
+spec:
+  template:
+    metadata:
+      labels:
+        workload: stable
+    spec:
+      nodeClassRef:
+        group: eks.amazonaws.com
+        kind: NodeClass
+        name: shopfront
+      taints:
+        - key: workload
+          value: stable
+          effect: NoSchedule
+      requirements:
+        - key: eks.amazonaws.com/instance-family
+          operator: In
+          values: [m7g, m8g, r7g]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: [on-demand]
+  limits:
+    cpu: "32"
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 15m
+  weight: 10

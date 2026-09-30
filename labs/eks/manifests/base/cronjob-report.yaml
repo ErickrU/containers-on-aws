@@ -1,0 +1,71 @@
+# The daily report as a Kubernetes CronJob: the in-cluster alternative to AWS Batch
+# (labs/batch/) and to ECS scheduled tasks. hub/09 L200 §2.7 compares the three.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: report-job
+  namespace: shopfront
+  labels:
+    app.kubernetes.io/name: report-job
+    app.kubernetes.io/part-of: shopfront
+spec:
+  schedule: "15 1 * * *"          # 01:15 UTC: yesterday is complete in every timezone the shop serves
+  timeZone: Etc/UTC
+  concurrencyPolicy: Forbid       # a slow run must not overlap the next one
+  startingDeadlineSeconds: 3600   # skip the run if the controller was down for more than an hour
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1             # one retry; the job is idempotent (same file name, overwritten)
+      activeDeadlineSeconds: 1800
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: report-job
+            app.kubernetes.io/part-of: shopfront
+        spec:
+          restartPolicy: Never
+          serviceAccountName: report-job
+          automountServiceAccountToken: false
+          terminationGracePeriodSeconds: 60
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: report-job
+              image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/shopfront/report-job:sha-0000000
+              imagePullPolicy: IfNotPresent
+              env:
+                - name: OTEL_SDK_DISABLED
+                  value: "true"
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: shopfront-db
+                      key: DATABASE_URL
+              envFrom:
+                - configMapRef:
+                    name: shopfront-config
+              resources:
+                requests:
+                  cpu: 250m
+                  memory: 256Mi
+                limits:
+                  memory: 512Mi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: [ALL]
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: tmp
+              emptyDir:
+                sizeLimit: 512Mi

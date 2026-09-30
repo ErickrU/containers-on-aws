@@ -1,0 +1,116 @@
+# Deploy to ECS by re-running the 04-services CloudFormation stack with the new image tag. The ECS
+# rolling deployment (circuit breaker + CloudWatch alarm rollback, hub/03 L200 §2.9) does the actual
+# traffic shift; this workflow only changes the desired task definition and waits for steady state.
+#
+# Copy to .github/workflows/deploy-ecs.yml. Runs after ci.yml succeeded on main (workflow_run) or by
+# hand with a tag. The "dev" environment can carry required reviewers, wait timers and branch rules
+# in GitHub -> Settings -> Environments; the OIDC trust policy should bind the deploy role to
+#   "token.actions.githubusercontent.com:sub": "repo:ErickrU/containers-on-aws:environment:dev"
+name: deploy-ecs
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Image tag pushed by ci (sha-<7>), or a digest suffix
+        required: true
+        default: sha-0000000
+      environment:
+        description: Target environment
+        required: true
+        default: dev
+        type: choice
+        options: [dev, staging]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-ecs-${{ inputs.environment || 'dev' }}
+  cancel-in-progress: false      # never cancel a deployment mid-flight
+
+env:
+  AWS_REGION: us-east-1
+  PROJECT: shopfront
+
+jobs:
+  deploy:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    name: deploy ${{ inputs.environment || 'dev' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: ${{ inputs.environment || 'dev' }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      ENV: ${{ inputs.environment || 'dev' }}
+      IMAGE_TAG: ${{ inputs.image_tag || format('sha-{0}', github.event.workflow_run.head_sha) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: configure AWS credentials (OIDC, deploy role)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/shopfront-deploy-${{ env.ENV }}
+          role-session-name: gha-deploy-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: normalise the tag (workflow_run gives the 40-char sha; ci tagged sha-<7>)
+        run: |
+          tag="${IMAGE_TAG}"
+          if [[ "$tag" =~ ^sha-[0-9a-f]{40}$ ]]; then tag="sha-${tag:4:7}"; fi
+          echo "IMAGE_TAG=${tag}" >> "$GITHUB_ENV"
+          echo "deploying image tag ${tag} to ${PROJECT}-${ENV}"
+
+      - name: verify the four images exist in ECR with this tag
+        run: |
+          for repo in orders catalog worker report-job; do
+            aws ecr describe-images --repository-name "${PROJECT}/${repo}" --image-ids "imageTag=${IMAGE_TAG}" \
+              --query 'imageDetails[0].{digest:imageDigest,pushed:imagePushedAt,scan:imageScanStatus.status}' --output table
+          done
+
+      - name: block on unresolved CRITICAL findings from ECR enhanced scanning
+        run: |
+          # shellcheck disable=SC2016  # the backticks are JMESPath literals, not shell
+          for repo in orders catalog worker report-job; do
+            critical="$(aws ecr describe-image-scan-findings --repository-name "${PROJECT}/${repo}" \
+              --image-id "imageTag=${IMAGE_TAG}" \
+              --query 'imageScanFindings.enhancedFindings[?severity==`CRITICAL` && status==`ACTIVE`] | length(@)' \
+              --output text 2>/dev/null || echo 0)"
+            echo "${repo}: ${critical} active CRITICAL finding(s)"
+            [[ "$critical" == "0" ]] || { echo "refusing to deploy ${repo}"; exit 1; }
+          done
+
+      - name: deploy 04-services with the new tag
+        run: |
+          alarms="$(aws cloudformation describe-stacks --stack-name "${PROJECT}-${ENV}-05-observability" \
+            --query "Stacks[0].Outputs[?OutputKey=='RollbackAlarmNames'].OutputValue" --output text 2>/dev/null || true)"
+          extra=()
+          if [[ -n "$alarms" && "$alarms" != "None" ]]; then extra+=("RollbackAlarmNames=${alarms}"); fi
+          aws cloudformation deploy \
+            --stack-name "${PROJECT}-${ENV}-04-services" \
+            --template-file labs/ecs/cloudformation/04-services.yaml \
+            --parameter-overrides "ProjectName=${PROJECT}" "Environment=${ENV}" "ImageTag=${IMAGE_TAG}" ${extra[@]+"${extra[@]}"} \
+            --capabilities CAPABILITY_NAMED_IAM --no-fail-on-empty-changeset
+
+      - name: wait for steady state and print the outcome
+        run: |
+          cluster="${PROJECT}-${ENV}"
+          aws ecs wait services-stable --cluster "$cluster" --services orders catalog fulfillment-worker
+          aws ecs describe-services --cluster "$cluster" --services orders catalog fulfillment-worker \
+            --query 'services[*].{service:serviceName,running:runningCount,desired:desiredCount,rollout:deployments[0].rolloutState,reason:deployments[0].rolloutStateReason}' \
+            --output table
+
+      - name: smoke test through the ALB
+        run: |
+          alb="$(aws cloudformation describe-stacks --stack-name "${PROJECT}-${ENV}-04-services" \
+            --query "Stacks[0].Outputs[?OutputKey=='LoadBalancerDnsName'].OutputValue" --output text)"
+          curl -fsS --retry 5 --retry-delay 5 "http://${alb}/products" | head -c 300; echo
+          curl -fsS -X POST "http://${alb}/orders" -H 'content-type: application/json' -d '{"productId":1,"quantity":1}' | head -c 300; echo

@@ -1,0 +1,196 @@
+# fulfillment-worker: SQS consumer. replicas is the floor; KEDA (scaledobject-fulfillment.yaml) owns
+# the count from there. Recreate is not used: two consumers on one queue are fine (at-least-once).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fulfillment-worker
+  namespace: shopfront
+  labels:
+    app.kubernetes.io/name: fulfillment-worker
+    app.kubernetes.io/part-of: shopfront
+    app.kubernetes.io/version: "0.1.0"
+spec:
+  replicas: 1
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fulfillment-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: fulfillment-worker
+        app.kubernetes.io/part-of: shopfront
+        app.kubernetes.io/version: "0.1.0"
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8082"
+        prometheus.io/path: /metrics
+    spec:
+      serviceAccountName: fulfillment-worker
+      automountServiceAccountToken: false
+      # Long poll (20 s) + in-flight message handling must finish before SIGKILL.
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: worker
+          image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/shopfront/worker:sha-0000000
+          imagePullPolicy: IfNotPresent
+          args: [-m, worker.fulfillment]
+          command: [python]
+          ports:
+            - name: http
+              containerPort: 8082
+              protocol: TCP
+          env:
+            - name: PORT
+              value: "8082"
+            - name: OTEL_SERVICE_NAME
+              value: fulfillment-worker
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: shopfront-db
+                  key: DATABASE_URL
+          envFrom:
+            - configMapRef:
+                name: shopfront-config
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 15
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+---
+# analytics-consumer: Kafka consumer (MSK). Pinned to on-demand capacity because a Spot interruption
+# forces a consumer-group rebalance. Overlays set replicas 0 where there is no Kafka.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: analytics-consumer
+  namespace: shopfront
+  labels:
+    app.kubernetes.io/name: analytics-consumer
+    app.kubernetes.io/part-of: shopfront
+    app.kubernetes.io/version: "0.1.0"
+spec:
+  replicas: 1
+  revisionHistoryLimit: 5
+  strategy:
+    type: Recreate      # one consumer per partition set; avoid two generations rebalancing twice
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: analytics-consumer
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: analytics-consumer
+        app.kubernetes.io/part-of: shopfront
+        app.kubernetes.io/version: "0.1.0"
+    spec:
+      serviceAccountName: analytics-consumer
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      nodeSelector:
+        workload: stable
+      tolerations:
+        - key: workload
+          operator: Equal
+          value: stable
+          effect: NoSchedule
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: analytics
+          image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/shopfront/worker:sha-0000000
+          imagePullPolicy: IfNotPresent
+          command: [python]
+          args: [-m, worker.analytics]
+          ports:
+            - name: http
+              containerPort: 8083
+              protocol: TCP
+          env:
+            - name: PORT
+              value: "8083"
+            - name: OTEL_SERVICE_NAME
+              value: analytics-consumer
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: shopfront-db
+                  key: DATABASE_URL
+          envFrom:
+            - configMapRef:
+                name: shopfront-config
+          resources:
+            requests:
+              cpu: 100m
+              memory: 192Mi
+            limits:
+              memory: 384Mi
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 15
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi

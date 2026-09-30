@@ -1,0 +1,76 @@
+# Helm values for Cilium 1.20.2 on an EKS standard cluster in ENI mode, replacing kube-proxy and the
+# VPC CNI network policy agent (hub/04 L300 §2.8, hub/05 L300 §2.7). Not for Auto Mode (the data plane is managed).
+#
+# Order of operations on a NEW cluster (do not do this live on a cluster that runs workloads):
+#   1. create the cluster with eksctl-standard.yaml but with `addons: []` for vpc-cni and kube-proxy
+#      (or delete the aws-node and kube-proxy DaemonSets: kubectl -n kube-system delete ds aws-node kube-proxy)
+#   2. helm repo add cilium https://helm.cilium.io && helm repo update
+#   3. helm upgrade --install cilium cilium/cilium --version 1.20.2 -n kube-system -f labs/eks/addons/cilium-values.yaml \
+#        --set k8sServiceHost=$(aws eks describe-cluster --name shopfront-dev --query cluster.endpoint --output text | sed 's#https://##') \
+#        --set k8sServicePort=443
+#   4. cilium status --wait && cilium connectivity test
+#
+# ENI mode keeps pod IPs routable in the VPC (security groups, VPC Flow Logs, ALB target-type ip
+# all keep working) while Cilium's eBPF datapath handles policy, service load balancing and Hubble.
+eni:
+  enabled: true
+  awsEnablePrefixDelegation: true        # /28 prefixes as with the VPC CNI
+  awsReleaseExcessIPs: true
+  updateEC2AdapterLimitViaAPI: true
+ipam:
+  mode: eni
+egressMasqueradeInterfaces: eth+
+routingMode: native
+enableIPv4Masquerade: true
+
+# kube-proxy replacement: Services are implemented in eBPF (no iptables chains, no conntrack table growth per Service).
+kubeProxyReplacement: true
+k8sServiceHost: REPLACE_WITH_CLUSTER_ENDPOINT_HOST
+k8sServicePort: 443
+bpf:
+  masquerade: true
+  lbExternalClusterIP: false
+
+# Network policy: Kubernetes NetworkPolicy plus CiliumNetworkPolicy (L7, DNS-aware, FQDN egress).
+policyEnforcementMode: default
+policyAuditMode: false
+
+hubble:
+  enabled: true
+  relay:
+    enabled: true
+  ui:
+    enabled: false                       # port-forward hubble-relay and use the CLI in the lab
+  metrics:
+    enabled:
+      - dns
+      - drop
+      - tcp
+      - flow
+      - port-distribution
+      - icmp
+      - httpV2:exemplars=true;labelsContext=source_ip,source_namespace,source_workload,destination_ip,destination_namespace,destination_workload,traffic_direction
+    serviceMonitor:
+      enabled: false
+
+operator:
+  replicas: 2
+  prometheus:
+    enabled: true
+prometheus:
+  enabled: true
+
+# Mutual TLS between pods with SPIFFE identities (Cilium mesh, hub/06 L400 §2.3) - opt in per policy.
+authentication:
+  mutual:
+    spire:
+      enabled: false
+
+resources:
+  requests: { cpu: 100m, memory: 512Mi }
+  limits: { memory: 1Gi }
+
+# Bottlerocket and AL2023 both work; on Bottlerocket the cgroup path differs.
+cgroup:
+  autoMount:
+    enabled: true

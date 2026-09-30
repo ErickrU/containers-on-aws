@@ -1,0 +1,42 @@
+{
+  "description": "shopfront game day: stop half of the orders tasks and confirm the service self-heals without ALB 5xx. Stops early when the orders-unhealthy composite alarm fires.",
+  "roleArn": "arn:aws:iam::123456789012:role/shopfront-dev-fis-experiment",
+  "targets": {
+    "orders-tasks": {
+      "resourceType": "aws:ecs:task",
+      "selectionMode": "PERCENT(50)",
+      "parameters": {
+        "cluster": "shopfront-dev",
+        "service": "orders"
+      }
+    }
+  },
+  "actions": {
+    "stop-orders-tasks": {
+      "actionId": "aws:ecs:stop-task",
+      "description": "Sends SIGTERM through ECS StopTask so the drain path (SIGTERM -> deregistration -> stopTimeout) is what gets tested.",
+      "targets": { "Tasks": "orders-tasks" }
+    }
+  },
+  "stopConditions": [
+    {
+      "source": "aws:cloudwatch:alarm",
+      "value": "arn:aws:cloudwatch:us-east-1:123456789012:alarm:shopfront-dev-orders-unhealthy"
+    }
+  ],
+  "logConfiguration": {
+    "logSchemaVersion": 2,
+    "cloudWatchLogsConfiguration": {
+      "logGroupArn": "arn:aws:logs:us-east-1:123456789012:log-group:/shopfront/dev/fis:*"
+    }
+  },
+  "experimentOptions": {
+    "accountTargeting": "single-account",
+    "emptyTargetResolutionMode": "fail"
+  },
+  "tags": {
+    "Project": "shopfront",
+    "Environment": "dev",
+    "Name": "orders-stop-half"
+  }
+}

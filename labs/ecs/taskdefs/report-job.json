@@ -1,0 +1,50 @@
+{
+  "family": "shopfront-dev-report-job",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "runtimePlatform": { "cpuArchitecture": "ARM64", "operatingSystemFamily": "LINUX" },
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::123456789012:role/shopfront-dev-task-execution",
+  "taskRoleArn": "arn:aws:iam::123456789012:role/shopfront-dev-report-job-task",
+  "volumes": [{ "name": "tmp" }],
+  "containerDefinitions": [
+    {
+      "name": "report-job",
+      "image": "123456789012.dkr.ecr.us-east-1.amazonaws.com/shopfront/report-job@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "essential": true,
+      "environment": [
+        { "name": "AWS_REGION", "value": "us-east-1" },
+        { "name": "REPORT_OUTPUT", "value": "s3://shopfront-reports-dev-123456789012/daily/" },
+        { "name": "OTEL_SDK_DISABLED", "value": "true" },
+        { "name": "LOG_LEVEL", "value": "INFO" }
+      ],
+      "secrets": [
+        { "name": "DATABASE_URL", "valueFrom": "arn:aws:secretsmanager:us-east-1:123456789012:secret:shopfront/dev/database-url" }
+      ],
+      "stopTimeout": 60,
+      "user": "10001:10001",
+      "readonlyRootFilesystem": true,
+      "linuxParameters": {
+        "initProcessEnabled": true,
+        "capabilities": { "drop": ["ALL"] }
+      },
+      "mountPoints": [{ "sourceVolume": "tmp", "containerPath": "/tmp", "readOnly": false }],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/shopfront/dev/report-job",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "scheduled",
+          "mode": "non-blocking",
+          "max-buffer-size": "10m"
+        }
+      }
+    }
+  ],
+  "tags": [
+    { "key": "Project", "value": "shopfront" },
+    { "key": "Environment", "value": "dev" },
+    { "key": "Service", "value": "report-job" }
+  ]
+}

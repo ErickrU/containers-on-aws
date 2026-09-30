@@ -1,0 +1,62 @@
+# Helm values for KEDA 2.21.0 (hub/09 L200 §2.3, L300 §2.6).
+#
+#   helm repo add kedacore https://kedacore.github.io/charts && helm repo update
+#   helm upgrade --install keda kedacore/keda --version 2.21.0 -n keda --create-namespace \
+#     -f labs/eks/addons/keda-values.yaml
+#
+# The operator reads SQS/CloudWatch/Kafka metrics with its own identity (Pod Identity association
+# keda/keda-operator from addons/pod-identity-associations.sh); TriggerAuthentication objects in
+# the workload namespaces reference it with podIdentity.provider: aws.
+operator:
+  replicaCount: 2
+  podDisruptionBudget:
+    maxUnavailable: 1
+  # Leader election is on by default; two replicas give a warm standby.
+
+serviceAccount:
+  operator:
+    create: true
+    name: keda-operator
+    annotations: {}          # no IRSA annotation: Pod Identity
+
+podIdentity:
+  aws:
+    irsa:
+      enabled: false         # KEDA's "aws" provider uses the operator's credential chain, which the
+                             # Pod Identity agent serves at 169.254.170.23
+
+# The external metrics adapter that the HPA controller queries.
+metricsServer:
+  replicaCount: 2
+  useHostNetwork: false
+
+resources:
+  operator:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { memory: 512Mi }
+  metricServer:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { memory: 512Mi }
+  webhooks:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { memory: 256Mi }
+
+securityContext:
+  operator:
+    runAsNonRoot: true
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities: { drop: [ALL] }
+    seccompProfile: { type: RuntimeDefault }
+
+prometheus:
+  operator:
+    enabled: true            # /metrics with scaler errors and latency
+    port: 8080
+  metricServer:
+    enabled: true
+
+logging:
+  operator:
+    level: info
+    format: json

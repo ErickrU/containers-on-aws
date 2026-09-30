@@ -1,0 +1,54 @@
+# One internet-facing ALB for the whole shopfront namespace (IngressGroup "shopfront"), pod IPs as
+# targets, health checks on /readyz, TLS terminated with an ACM certificate, HTTP redirected to HTTPS.
+# Annotations are the AWS Load Balancer Controller's dialect (hub/05 L200 §2.3). On EKS Auto Mode the
+# built-in controller understands the same annotations; use IngressClass "alb" there too.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: shopfront
+  namespace: shopfront
+  labels:
+    app.kubernetes.io/part-of: shopfront
+  annotations:
+    alb.ingress.kubernetes.io/group.name: shopfront
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/ip-address-type: ipv4
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+    # Overlays replace the certificate ARN; with the controller's certificate discovery you can also
+    # omit it and set spec.tls[].hosts to a name that matches an ACM certificate.
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:us-east-1:123456789012:certificate/11111111-2222-3333-4444-5555555555ab
+    alb.ingress.kubernetes.io/healthcheck-path: /readyz
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "15"
+    alb.ingress.kubernetes.io/healthcheck-timeout-seconds: "5"
+    alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+    alb.ingress.kubernetes.io/unhealthy-threshold-count: "3"
+    alb.ingress.kubernetes.io/success-codes: "200"
+    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=60,routing.http.drop_invalid_header_fields.enabled=true,routing.http2.enabled=true,deletion_protection.enabled=false
+    alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=20,load_balancing.algorithm.type=least_outstanding_requests
+    # alb.ingress.kubernetes.io/wafv2-acl-arn: arn:aws:wafv2:us-east-1:123456789012:regional/webacl/shopfront/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+    alb.ingress.kubernetes.io/tags: Project=shopfront,Environment=dev
+spec:
+  ingressClassName: alb
+  tls:
+    - hosts: [shopfront.example.com]
+  rules:
+    - host: shopfront.example.com
+      http:
+        paths:
+          - path: /orders
+            pathType: Prefix
+            backend:
+              service:
+                name: orders
+                port:
+                  name: http
+          - path: /products
+            pathType: Prefix
+            backend:
+              service:
+                name: catalog
+                port:
+                  name: http

@@ -1,0 +1,12 @@
+# Mirrors [project].dependencies in pyproject.toml. Keep both lists identical.
+boto3==1.43.105
+psycopg[binary,pool]==3.3.6
+psycopg-pool==3.3.3
+confluent-kafka==2.15.1
+prometheus-client==0.26.0
+opentelemetry-api==1.45.0
+opentelemetry-sdk==1.45.0
+opentelemetry-exporter-otlp-proto-http==1.45.0
+opentelemetry-instrumentation-botocore==0.66b0
+opentelemetry-instrumentation-psycopg==0.66b0
+aws-msk-iam-sasl-signer-python==1.0.2

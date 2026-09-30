@@ -1,0 +1,350 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  shopfront cluster layer: ECS cluster (Container Insights enhanced, Fargate capacity providers,
+  ECS Exec logging), Cloud Map namespace for Service Connect, ECR repositories with lifecycle and
+  optional cross-Region replication, IAM roles (execution + one task role per service), log groups.
+  Teaching lab (see hub/02-ecr, hub/03-ecs, hub/06-identity-and-security).
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: shopfront
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  ReplicationRegion:
+    Type: String
+    Default: ''
+    Description: Optional DR Region for ECR replication (for example us-west-2). Empty disables replication.
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [7, 14, 30, 60, 90, 180, 365]
+
+Conditions:
+  Replicate: !Not [!Equals [!Ref ReplicationRegion, '']]
+
+Resources:
+  # ------------------------------------------------------------------ cluster and namespace ---
+  ServiceConnectNamespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: !Sub '${ProjectName}.local'
+      Description: Service Connect and Cloud Map namespace for shopfront
+      Vpc: !ImportValue
+        Fn::Sub: '${ProjectName}-${Environment}-VpcId'
+
+  ExecLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/${ProjectName}/${Environment}/ecs-exec'
+      RetentionInDays: 365
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${ProjectName}-${Environment}'
+      CapacityProviders: [FARGATE, FARGATE_SPOT]
+      DefaultCapacityProviderStrategy:
+        - { CapacityProvider: FARGATE, Weight: 1, Base: 0 }
+      ClusterSettings:
+        - { Name: containerInsights, Value: enhanced }
+      Configuration:
+        ExecuteCommandConfiguration:
+          Logging: OVERRIDE
+          LogConfiguration:
+            CloudWatchLogGroupName: !Ref ExecLogGroup
+            CloudWatchEncryptionEnabled: false
+      ServiceConnectDefaults:
+        Namespace: !GetAtt ServiceConnectNamespace.Arn
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  # ------------------------------------------------------------------ ECR --------------------
+  CatalogRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${ProjectName}/catalog'
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration: { ScanOnPush: true }
+      EncryptionConfiguration: { EncryptionType: AES256 }
+      EmptyOnDelete: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[
+            {"rulePriority":1,"description":"expire untagged after 3 days","selection":{"tagStatus":"untagged","countType":"sinceImagePushed","countUnit":"days","countNumber":3},"action":{"type":"expire"}},
+            {"rulePriority":2,"description":"keep last 30 sha- builds","selection":{"tagStatus":"tagged","tagPrefixList":["sha-"],"countType":"imageCountMoreThan","countNumber":30},"action":{"type":"expire"}}
+          ]}
+  OrdersRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${ProjectName}/orders'
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration: { ScanOnPush: true }
+      EncryptionConfiguration: { EncryptionType: AES256 }
+      EmptyOnDelete: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[
+            {"rulePriority":1,"description":"expire untagged after 3 days","selection":{"tagStatus":"untagged","countType":"sinceImagePushed","countUnit":"days","countNumber":3},"action":{"type":"expire"}},
+            {"rulePriority":2,"description":"keep last 30 sha- builds","selection":{"tagStatus":"tagged","tagPrefixList":["sha-"],"countType":"imageCountMoreThan","countNumber":30},"action":{"type":"expire"}}
+          ]}
+  WorkerRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${ProjectName}/worker'
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration: { ScanOnPush: true }
+      EncryptionConfiguration: { EncryptionType: AES256 }
+      EmptyOnDelete: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[
+            {"rulePriority":1,"description":"expire untagged after 3 days","selection":{"tagStatus":"untagged","countType":"sinceImagePushed","countUnit":"days","countNumber":3},"action":{"type":"expire"}},
+            {"rulePriority":2,"description":"keep last 30 sha- builds","selection":{"tagStatus":"tagged","tagPrefixList":["sha-"],"countType":"imageCountMoreThan","countNumber":30},"action":{"type":"expire"}}
+          ]}
+  ReportJobRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${ProjectName}/report-job'
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration: { ScanOnPush: true }
+      EncryptionConfiguration: { EncryptionType: AES256 }
+      EmptyOnDelete: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[
+            {"rulePriority":1,"description":"expire untagged after 3 days","selection":{"tagStatus":"untagged","countType":"sinceImagePushed","countUnit":"days","countNumber":3},"action":{"type":"expire"}},
+            {"rulePriority":2,"description":"keep last 30 sha- builds","selection":{"tagStatus":"tagged","tagPrefixList":["sha-"],"countType":"imageCountMoreThan","countNumber":30},"action":{"type":"expire"}}
+          ]}
+
+  # Registry-level (one per account/Region); replicates every shopfront/* push to the DR Region.
+  EcrReplication:
+    Type: AWS::ECR::ReplicationConfiguration
+    Condition: Replicate
+    Properties:
+      ReplicationConfiguration:
+        Rules:
+          - Destinations:
+              - { Region: !Ref ReplicationRegion, RegistryId: !Ref AWS::AccountId }
+            RepositoryFilters:
+              - { Filter: !Sub '${ProjectName}/', FilterType: PREFIX_MATCH }
+
+  # ------------------------------------------------------------------ log groups --------------
+  OrdersLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/${ProjectName}/${Environment}/orders'
+      RetentionInDays: !Ref LogRetentionDays
+  CatalogLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/${ProjectName}/${Environment}/catalog'
+      RetentionInDays: !Ref LogRetentionDays
+  WorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/${ProjectName}/${Environment}/fulfillment-worker'
+      RetentionInDays: !Ref LogRetentionDays
+  AnalyticsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/${ProjectName}/${Environment}/analytics-consumer'
+      RetentionInDays: !Ref LogRetentionDays
+  ReportJobLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/${ProjectName}/${Environment}/report-job'
+      RetentionInDays: !Ref LogRetentionDays
+  OtelLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/${ProjectName}/${Environment}/otel'
+      RetentionInDays: !Ref LogRetentionDays
+  ServiceConnectLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/${ProjectName}/${Environment}/service-connect'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ------------------------------------------------------------------ IAM: execution role -----
+  # Used by the ECS agent / Fargate before containers start: pull images, fetch secrets, write logs.
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-task-execution'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              ArnLike: { 'aws:SourceArn': !Sub 'arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:*' }
+              StringEquals: { 'aws:SourceAccount': !Ref AWS::AccountId }
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+      Policies:
+        - PolicyName: secrets-and-logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [secretsmanager:GetSecretValue]
+                Resource: !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectName}/${Environment}/*'
+              - Effect: Allow
+                Action: [ssm:GetParameters]
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/${Environment}/*'
+              - Effect: Allow
+                Action: [logs:CreateLogGroup]
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/${ProjectName}/${Environment}/*'
+
+  # ------------------------------------------------------------------ IAM: task roles ---------
+  # One role per service; the application uses it through 169.254.170.2 (hub/03 L300 §2.3).
+  OrdersTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-orders-task'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              ArnLike: { 'aws:SourceArn': !Sub 'arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:*' }
+              StringEquals: { 'aws:SourceAccount': !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: orders
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [sqs:SendMessage, sqs:GetQueueAttributes]
+                Resource: !Sub 'arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${ProjectName}-${Environment}-orders-created'
+              - Effect: Allow
+                Action: [kafka-cluster:Connect, kafka-cluster:DescribeCluster, kafka-cluster:DescribeTopic, kafka-cluster:WriteData, kafka-cluster:CreateTopic]
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:cluster/${ProjectName}-${Environment}/*'
+                  - !Sub 'arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:topic/${ProjectName}-${Environment}/*/orders.created'
+              - Effect: Allow
+                Action: [xray:PutTraceSegments, xray:PutTelemetryRecords, cloudwatch:PutMetricData]
+                Resource: '*'
+              - Effect: Allow
+                Action: [ssmmessages:CreateControlChannel, ssmmessages:CreateDataChannel, ssmmessages:OpenControlChannel, ssmmessages:OpenDataChannel]
+                Resource: '*'
+
+  CatalogTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-catalog-task'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              ArnLike: { 'aws:SourceArn': !Sub 'arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:*' }
+              StringEquals: { 'aws:SourceAccount': !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: catalog
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [xray:PutTraceSegments, xray:PutTelemetryRecords, cloudwatch:PutMetricData]
+                Resource: '*'
+              - Effect: Allow
+                Action: [ssmmessages:CreateControlChannel, ssmmessages:CreateDataChannel, ssmmessages:OpenControlChannel, ssmmessages:OpenDataChannel]
+                Resource: '*'
+
+  WorkerTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-worker-task'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              ArnLike: { 'aws:SourceArn': !Sub 'arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:*' }
+              StringEquals: { 'aws:SourceAccount': !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: worker
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:ChangeMessageVisibility, sqs:GetQueueAttributes]
+                Resource: !Sub 'arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${ProjectName}-${Environment}-orders-created'
+              - Effect: Allow
+                Action: [kafka-cluster:Connect, kafka-cluster:DescribeCluster, kafka-cluster:DescribeTopic, kafka-cluster:ReadData, kafka-cluster:DescribeGroup, kafka-cluster:AlterGroup]
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:cluster/${ProjectName}-${Environment}/*'
+                  - !Sub 'arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:topic/${ProjectName}-${Environment}/*/orders.created'
+                  - !Sub 'arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:group/${ProjectName}-${Environment}/*/analytics'
+              - Effect: Allow
+                Action: [xray:PutTraceSegments, xray:PutTelemetryRecords, cloudwatch:PutMetricData]
+                Resource: '*'
+              - Effect: Allow
+                Action: [ssmmessages:CreateControlChannel, ssmmessages:CreateDataChannel, ssmmessages:OpenControlChannel, ssmmessages:OpenDataChannel]
+                Resource: '*'
+
+  ReportJobTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-report-job-task'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              ArnLike: { 'aws:SourceArn': !Sub 'arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:*' }
+              StringEquals: { 'aws:SourceAccount': !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: report-job
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:PutObject, s3:AbortMultipartUpload]
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ProjectName}-reports-${Environment}-${AWS::AccountId}/daily/*'
+
+Outputs:
+  ClusterName:
+    Value: !Ref Cluster
+    Export: { Name: !Sub '${ProjectName}-${Environment}-ClusterName' }
+  ClusterArn:
+    Value: !GetAtt Cluster.Arn
+    Export: { Name: !Sub '${ProjectName}-${Environment}-ClusterArn' }
+  NamespaceArn:
+    Value: !GetAtt ServiceConnectNamespace.Arn
+    Export: { Name: !Sub '${ProjectName}-${Environment}-NamespaceArn' }
+  NamespaceName:
+    Value: !Sub '${ProjectName}.local'
+    Export: { Name: !Sub '${ProjectName}-${Environment}-NamespaceName' }
+  TaskExecutionRoleArn:
+    Value: !GetAtt TaskExecutionRole.Arn
+    Export: { Name: !Sub '${ProjectName}-${Environment}-TaskExecutionRoleArn' }
+  OrdersTaskRoleArn:
+    Value: !GetAtt OrdersTaskRole.Arn
+    Export: { Name: !Sub '${ProjectName}-${Environment}-OrdersTaskRoleArn' }
+  CatalogTaskRoleArn:
+    Value: !GetAtt CatalogTaskRole.Arn
+    Export: { Name: !Sub '${ProjectName}-${Environment}-CatalogTaskRoleArn' }
+  WorkerTaskRoleArn:
+    Value: !GetAtt WorkerTaskRole.Arn
+    Export: { Name: !Sub '${ProjectName}-${Environment}-WorkerTaskRoleArn' }
+  ReportJobTaskRoleArn:
+    Value: !GetAtt ReportJobTaskRole.Arn
+    Export: { Name: !Sub '${ProjectName}-${Environment}-ReportJobTaskRoleArn' }
+  RegistryUri:
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.${AWS::URLSuffix}/${ProjectName}'
+    Export: { Name: !Sub '${ProjectName}-${Environment}-RegistryUri' }

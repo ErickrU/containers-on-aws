@@ -1,0 +1,74 @@
+# dev overlay: small, HTTP-only ALB (no certificate), no Kafka consumer, images by tag.
+#   kubectl apply -k labs/eks/manifests/overlays/dev
+#   kubectl kustomize labs/eks/manifests/overlays/dev | kubeconform -strict -ignore-missing-schemas -summary
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+images:
+  - name: 123456789012.dkr.ecr.us-east-1.amazonaws.com/shopfront/orders
+    newTag: dev
+  - name: 123456789012.dkr.ecr.us-east-1.amazonaws.com/shopfront/catalog
+    newTag: dev
+  - name: 123456789012.dkr.ecr.us-east-1.amazonaws.com/shopfront/worker
+    newTag: dev
+  - name: 123456789012.dkr.ecr.us-east-1.amazonaws.com/shopfront/report-job
+    newTag: dev
+
+patches:
+  # No Kafka in dev: keep the Deployment (so prod and dev differ only in numbers), run zero replicas.
+  - target:
+      kind: Deployment
+      name: analytics-consumer
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 0
+  # One replica floor for the HTTP services is enough for dev; the PDB maxUnavailable: 1 stays valid.
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: orders
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 1
+      - op: replace
+        path: /spec/maxReplicas
+        value: 4
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: catalog
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 1
+      - op: replace
+        path: /spec/maxReplicas
+        value: 4
+  # HTTP only: drop the HTTPS listener, the redirect and the certificate (no ACM certificate in dev).
+  - target:
+      kind: Ingress
+      name: shopfront
+    patch: |-
+      - op: replace
+        path: /metadata/annotations/alb.ingress.kubernetes.io~1listen-ports
+        value: '[{"HTTP": 80}]'
+      - op: remove
+        path: /metadata/annotations/alb.ingress.kubernetes.io~1ssl-redirect
+      - op: remove
+        path: /metadata/annotations/alb.ingress.kubernetes.io~1certificate-arn
+      - op: remove
+        path: /metadata/annotations/alb.ingress.kubernetes.io~1ssl-policy
+      - op: remove
+        path: /spec/tls
+      - op: remove
+        path: /spec/rules/0/host
+  - target:
+      kind: ConfigMap
+      name: shopfront-config
+    patch: |-
+      - op: replace
+        path: /data/OTEL_RESOURCE_ATTRIBUTES
+        value: deployment.environment=dev

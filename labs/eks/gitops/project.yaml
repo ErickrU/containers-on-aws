@@ -1,0 +1,55 @@
+# Argo CD AppProject for shopfront (hub/08 L200 §2.6, L300 §2.4). Works with self-managed Argo CD
+# (namespace argocd) and with the EKS Capability for Argo CD (change metadata.namespace to the
+# namespace the capability uses). A Project is the blast-radius boundary: which repos, which
+# clusters/namespaces, which resource kinds, and who may sync.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: shopfront
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: shopfront
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  description: shopfront services (orders, catalog, workers, report-job)
+  sourceRepos:
+    - https://github.com/ErickrU/containers-on-aws.git
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: shopfront
+    - name: shopfront-prod              # registered cluster name (argocd cluster add)
+      namespace: shopfront
+  # Cluster-scoped kinds the app may create: only the namespace itself.
+  clusterResourceWhitelist: # term-ok (Argo CD field name)
+    - group: ""
+      kind: Namespace
+  namespaceResourceBlacklist: # term-ok (Argo CD field name)
+    - group: ""
+      kind: ResourceQuota
+    - group: ""
+      kind: LimitRange
+    - group: rbac.authorization.k8s.io
+      kind: RoleBinding
+  orphanedResources:
+    warn: true
+  syncWindows:
+    - kind: deny
+      schedule: "0 22 * * *"            # no automated syncs 22:00-06:00 UTC
+      duration: 8h
+      applications: ["shopfront-prod"]
+      manualSync: true
+  roles:
+    - name: developers
+      description: read and sync dev, read prod
+      policies:
+        - p, proj:shopfront:developers, applications, get, shopfront/*, allow
+        - p, proj:shopfront:developers, applications, sync, shopfront/shopfront-dev, allow
+      groups:
+        - shopfront-developers          # SSO group claim
+    - name: release-managers
+      policies:
+        - p, proj:shopfront:release-managers, applications, sync, shopfront/*, allow
+        - p, proj:shopfront:release-managers, applications, action/*, shopfront/*, allow
+      groups:
+        - shopfront-release-managers

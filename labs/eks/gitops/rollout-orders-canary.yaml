@@ -1,0 +1,166 @@
+# Argo Rollouts canary for orders with ALB weighted target groups and CloudWatch analysis
+# (hub/08 L300 §2.3). Standalone example: it takes over the existing Deployment through workloadRef,
+# so nothing in manifests/base changes; apply it after Argo Rollouts (addons/argo-rollouts-values.yaml).
+#
+#   kubectl apply -f labs/eks/gitops/rollout-orders-canary.yaml
+#   kubectl argo rollouts get rollout orders -n shopfront --watch
+#   kubectl argo rollouts set image orders orders=123456789012.dkr.ecr.us-east-1.amazonaws.com/shopfront/orders@sha256:<new-digest> -n shopfront
+#   kubectl argo rollouts abort orders -n shopfront      # traffic back to stable, canary scaled down
+#
+# How the ALB weights work: the controller writes the annotation
+# alb.ingress.kubernetes.io/actions.orders on the Ingress with a forward action across two target
+# groups (stable Service "orders", canary Service "orders-canary"), and the load balancer controller
+# turns that into a weighted listener rule. The Ingress backend for /orders must therefore reference
+# the rootService "orders" by name (manifests/base/ingress.yaml does).
+apiVersion: v1
+kind: Service
+metadata:
+  name: orders-canary
+  namespace: shopfront
+  labels:
+    app.kubernetes.io/name: orders
+    app.kubernetes.io/part-of: shopfront
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: orders      # the controller adds rollouts-pod-template-hash to this selector
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: alb-canary-health
+  namespace: shopfront
+  labels:
+    app.kubernetes.io/part-of: shopfront
+spec:
+  args:
+    - name: load-balancer               # app/k8s-shopfront-...  (aws elbv2 describe-load-balancers)
+    - name: canary-target-group         # targetgroup/k8s-shopfron-orderscan-.../...
+  metrics:
+    # Target 5xx ratio of the canary target group over the last five 1-minute windows. One failing
+    # measurement aborts the rollout; an empty result (no traffic yet) counts as success.
+    - name: canary-5xx-ratio
+      interval: 1m
+      count: 5
+      failureLimit: 1
+      successCondition: "len(result[0].Values) == 0 || all(result[0].Values, {# <= 0.02})"
+      provider:
+        cloudWatch:
+          interval: 5m
+          metricDataQueries:
+            - id: e5xx
+              returnData: false
+              metricStat:
+                period: 60
+                stat: Sum
+                metric:
+                  namespace: AWS/ApplicationELB
+                  metricName: HTTPCode_Target_5XX_Count
+                  dimensions:
+                    - name: LoadBalancer
+                      value: "{{ args.load-balancer }}"
+                    - name: TargetGroup
+                      value: "{{ args.canary-target-group }}"
+            - id: req
+              returnData: false
+              metricStat:
+                period: 60
+                stat: Sum
+                metric:
+                  namespace: AWS/ApplicationELB
+                  metricName: RequestCount
+                  dimensions:
+                    - name: LoadBalancer
+                      value: "{{ args.load-balancer }}"
+                    - name: TargetGroup
+                      value: "{{ args.canary-target-group }}"
+            - id: ratio
+              returnData: true
+              expression: "IF(req > 0, FILL(e5xx, 0) / req, 0)"
+    # p99 latency of the canary must stay under one second.
+    - name: canary-p99-latency
+      interval: 1m
+      count: 5
+      failureLimit: 2
+      successCondition: "len(result[0].Values) == 0 || all(result[0].Values, {# <= 1.0})"
+      provider:
+        cloudWatch:
+          interval: 5m
+          metricDataQueries:
+            - id: p99
+              returnData: true
+              metricStat:
+                period: 60
+                stat: p99
+                metric:
+                  namespace: AWS/ApplicationELB
+                  metricName: TargetResponseTime
+                  dimensions:
+                    - name: LoadBalancer
+                      value: "{{ args.load-balancer }}"
+                    - name: TargetGroup
+                      value: "{{ args.canary-target-group }}"
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: orders
+  namespace: shopfront
+  labels:
+    app.kubernetes.io/name: orders
+    app.kubernetes.io/part-of: shopfront
+spec:
+  replicas: 3
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: orders
+  # Adopt the Deployment's pod template; the Deployment is scaled down progressively as the Rollout
+  # takes traffic, so the migration itself is a canary.
+  workloadRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: orders
+    scaleDown: progressively
+  strategy:
+    canary:
+      stableService: orders
+      canaryService: orders-canary
+      dynamicStableScale: true          # stable shrinks as canary weight grows: no 2x capacity spike
+      abortScaleDownDelaySeconds: 30
+      trafficRouting:
+        alb:
+          ingress: shopfront
+          servicePort: 8080
+          rootService: orders
+      steps:
+        - setWeight: 5
+        - pause: { duration: 5m }
+        - analysis:
+            templates:
+              - templateName: alb-canary-health
+            args:
+              - name: load-balancer
+                value: app/k8s-shopfront-aaaaaaaaaa/bbbbbbbbbbbbbbbb
+              - name: canary-target-group
+                value: targetgroup/k8s-shopfron-orderscan-cccccccccc/dddddddddddddddd
+        - setWeight: 25
+        - pause: { duration: 5m }
+        - setWeight: 50
+        - pause: { duration: 10m }
+        # then 100%: stable Service selector switches to the new hash, old ReplicaSet scales down
+      analysis:
+        # Background analysis runs from step 1 to the end alongside the inline step above.
+        startingStep: 1
+        templates:
+          - templateName: alb-canary-health
+        args:
+          - name: load-balancer
+            value: app/k8s-shopfront-aaaaaaaaaa/bbbbbbbbbbbbbbbb
+          - name: canary-target-group
+            value: targetgroup/k8s-shopfron-orderscan-cccccccccc/dddddddddddddddd

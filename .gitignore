@@ -1,0 +1,26 @@
+# dependencies and build output
+node_modules/
+dist/
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.mypy_cache/
+coverage/
+*.test
+bin/
+
+# local lab state
+labs/local/out/
+labs/local/.env
+.env
+
+# tool caches
+.terraform/
+cdk.out/
+*.log
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

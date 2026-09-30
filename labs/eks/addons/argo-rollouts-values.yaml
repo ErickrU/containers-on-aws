@@ -1,0 +1,45 @@
+# Helm values for Argo Rollouts (chart 2.43.2, app v1.10.0) - hub/08 L300 §2.3.
+#
+#   helm repo add argo https://argoproj.github.io/argo-helm && helm repo update
+#   helm upgrade --install argo-rollouts argo/argo-rollouts --version 2.43.2 \
+#     -n argo-rollouts --create-namespace -f labs/eks/addons/argo-rollouts-values.yaml
+#   kubectl argo rollouts version          # kubectl plugin: https://argo-rollouts.readthedocs.io
+#
+# The controller rewrites the ALB Ingress annotation `alb.ingress.kubernetes.io/actions.<service>`
+# to shift weight between the stable and canary Services (gitops/rollout-orders-canary.yaml). The
+# CloudWatch metrics provider used by the AnalysisTemplate needs a Pod Identity association for
+# argo-rollouts/argo-rollouts with cloudwatch:GetMetricData.
+controller:
+  replicas: 2
+  pdb:
+    enabled: true
+    maxUnavailable: 1
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: false
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { memory: 512Mi }
+  containerSecurityContext:
+    runAsNonRoot: true
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities: { drop: [ALL] }
+    seccompProfile: { type: RuntimeDefault }
+  # Traffic routing plugins are not needed for ALB (native); Gateway API would need one.
+  extraArgs:
+    - --alb-verify-weight                 # confirm the ALB rule weights before continuing a step
+
+serviceAccount:
+  create: true
+  name: argo-rollouts
+  annotations: {}
+
+dashboard:
+  enabled: false                          # `kubectl argo rollouts dashboard` on demand instead
+
+# Notifications (Slack/SNS) on rollout aborted/completed: enable and configure the argo-rollouts-notification-configmap.
+notifications:
+  secret:
+    create: false

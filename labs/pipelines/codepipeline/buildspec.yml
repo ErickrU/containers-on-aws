@@ -1,0 +1,89 @@
+# CodeBuild buildspec for the shopfront images (hub/08 L200 §2.2). Runs on an ARM64 CodeBuild
+# fleet (aws/codebuild/amazonlinux-aarch64-standard:3.0) with privileged mode ON, which BuildKit
+# needs for multi-arch through QEMU. The project's service role gives ECR push; no keys anywhere.
+#
+# Inputs (environment variables from pipeline.yaml): AWS_ACCOUNT_ID, AWS_DEFAULT_REGION, IMAGE_PREFIX.
+# Output artifact: imagedefinitions.json is not used (we deploy through CloudFormation, not the
+# ECS deploy action); instead images.env carries the digests for the deploy stage.
+version: 0.2
+
+env:
+  shell: bash
+  variables:
+    IMAGE_PREFIX: shopfront
+    PLATFORMS: linux/amd64,linux/arm64
+    SERVICES: orders catalog worker report-job
+  exported-variables:
+    - IMAGE_TAG
+
+phases:
+  install:
+    runtime-versions:
+      golang: 1.23
+      nodejs: 22
+      python: 3.12
+    commands:
+      - echo "CodeBuild ${CODEBUILD_BUILD_ID} on $(uname -m)"
+      - docker buildx create --name multi --driver docker-container --use
+      - docker run --privileged --rm tonistiigi/binfmt:qemu-v10.2.3 --install amd64
+      - curl -fsSL -o /usr/local/bin/hadolint https://github.com/hadolint/hadolint/releases/download/v2.15.1/hadolint-Linux-arm64 && chmod +x /usr/local/bin/hadolint
+      - curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.74.0
+
+  pre_build:
+    commands:
+      - export IMAGE_TAG="sha-${CODEBUILD_RESOLVED_SOURCE_VERSION:0:7}"
+      - export REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+      - echo "building ${IMAGE_TAG} for ${SERVICES}"
+      - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$REGISTRY"
+      - for svc in $SERVICES; do hadolint "labs/apps/${svc}/Dockerfile"; done
+      # unit tests
+      - (cd labs/apps/catalog && go vet ./... && go test -race -count=1 ./...)
+      - (cd labs/apps/orders && npm ci && npm test)
+      - pip install --quiet -r labs/apps/worker/requirements.txt -r labs/apps/report-job/requirements.txt pytest
+      - python -m pytest -q labs/apps/worker labs/apps/report-job
+
+  build:
+    commands:
+      - |
+        set -euo pipefail
+        : > images.env
+        for svc in $SERVICES; do
+          image="${REGISTRY}/${IMAGE_PREFIX}/${svc}"
+          docker buildx build "labs/apps/${svc}" \
+            --platform "$PLATFORMS" \
+            --build-arg VERSION="$IMAGE_TAG" --build-arg REVISION="$CODEBUILD_RESOLVED_SOURCE_VERSION" \
+            --sbom=true --provenance=mode=max \
+            --cache-from "type=registry,ref=${image}:buildcache" \
+            --cache-to "type=registry,ref=${image}:buildcache,mode=max,image-manifest=true,oci-mediatypes=true" \
+            --tag "${image}:${IMAGE_TAG}" --tag "${image}:latest" \
+            --metadata-file "/tmp/${svc}.json" \
+            --push
+          digest="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["containerimage.digest"])' "/tmp/${svc}.json")"
+          echo "${svc}=${image}@${digest}" | tee -a images.env
+        done
+        # The CloudFormation deploy action reads parameter values from a JSON artifact (Fn::GetParam).
+        printf '{"ImageTag": "%s"}\n' "$IMAGE_TAG" > image-tag.json
+
+  post_build:
+    commands:
+      - |
+        set -euo pipefail
+        while IFS='=' read -r svc ref; do
+          trivy image --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 --format table "$ref"
+        done < images.env
+      - echo "images pushed with tag ${IMAGE_TAG}"
+
+artifacts:
+  files:
+    - images.env
+    - image-tag.json
+    - labs/ecs/cloudformation/04-services.yaml
+    - labs/ecs/cloudformation/parameters/dev.json
+  name: build-output
+
+cache:
+  paths:
+    - /root/.cache/go-build/**/*
+    - /root/go/pkg/mod/**/*
+    - /root/.npm/**/*
+    - /root/.cache/pip/**/*

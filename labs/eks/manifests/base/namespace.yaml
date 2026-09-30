@@ -1,0 +1,17 @@
+# The shopfront namespace. Pod Security Admission enforces the "restricted" profile: every pod must
+# run as non-root, drop all capabilities, use the RuntimeDefault seccomp profile and disallow
+# privilege escalation. The readiness-gate label makes the AWS Load Balancer Controller inject a
+# readiness gate so a pod is Ready only after the ALB target group reports it healthy (hub/05 L200 §2.3).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shopfront
+  labels:
+    app.kubernetes.io/part-of: shopfront
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+    elbv2.k8s.aws/pod-readiness-gate-inject: enabled
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"

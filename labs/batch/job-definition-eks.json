@@ -1,0 +1,115 @@
+{
+  "jobDefinitionName": "shopfront-dev-report-job-eks",
+  "type": "container",
+  "propagateTags": true,
+  "retryStrategy": {
+    "attempts": 2,
+    "evaluateOnExit": [
+      {
+        "action": "EXIT",
+        "onExitCode": "1"
+      },
+      {
+        "action": "RETRY",
+        "onReason": "*"
+      }
+    ]
+  },
+  "timeout": {
+    "attemptDurationSeconds": 1800
+  },
+  "eksProperties": {
+    "podProperties": {
+      "serviceAccountName": "report-job",
+      "hostNetwork": false,
+      "dnsPolicy": "ClusterFirst",
+      "shareProcessNamespace": false,
+      "metadata": {
+        "labels": {
+          "app.kubernetes.io/name": "report-job",
+          "app.kubernetes.io/part-of": "shopfront"
+        }
+      },
+      "containers": [
+        {
+          "name": "report-job",
+          "image": "123456789012.dkr.ecr.us-east-1.amazonaws.com/shopfront/report-job@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "imagePullPolicy": "IfNotPresent",
+          "env": [
+            {
+              "name": "AWS_REGION",
+              "value": "us-east-1"
+            },
+            {
+              "name": "DATABASE_URL_FILE",
+              "value": "/secrets/DATABASE_URL"
+            },
+            {
+              "name": "REPORT_OUTPUT",
+              "value": "s3://shopfront-reports-dev-123456789012/daily/"
+            },
+            {
+              "name": "OTEL_SDK_DISABLED",
+              "value": "true"
+            },
+            {
+              "name": "LOG_LEVEL",
+              "value": "INFO"
+            }
+          ],
+          "resources": {
+            "requests": {
+              "cpu": "500m",
+              "memory": "1024Mi"
+            },
+            "limits": {
+              "cpu": "1",
+              "memory": "1024Mi"
+            }
+          },
+          "securityContext": {
+            "runAsUser": 10001,
+            "runAsGroup": 10001,
+            "runAsNonRoot": true,
+            "readOnlyRootFilesystem": true,
+            "privileged": false,
+            "allowPrivilegeEscalation": false
+          },
+          "volumeMounts": [
+            {
+              "name": "tmp",
+              "mountPath": "/tmp",
+              "readOnly": false
+            },
+            {
+              "name": "db",
+              "mountPath": "/secrets",
+              "readOnly": true
+            }
+          ]
+        }
+      ],
+      "volumes": [
+        {
+          "name": "tmp",
+          "emptyDir": {
+            "sizeLimit": "512Mi"
+          }
+        },
+        {
+          "name": "db",
+          "secret": {
+            "secretName": "shopfront-db",
+            "optional": false
+          }
+        }
+      ]
+    }
+  },
+  "tags": {
+    "Project": "shopfront",
+    "Environment": "dev",
+    "Service": "report-job",
+    "Note": "Batch on EKS has no secrets[]: the shopfront-db Secret is mounted at /secrets and read through DATABASE_URL_FILE (labs/CONTRACT.md)"
+  }
+}

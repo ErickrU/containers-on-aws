@@ -1,0 +1,40 @@
+# ClusterIP Services. The ALB uses target-type ip, so it registers pod IPs directly from the
+# EndpointSlices of these Services; kube-proxy is only involved for in-cluster calls
+# (orders -> catalog). hub/04 L200 §2.3 covers Service types and hub/04 L300 §2.5 the datapath.
+apiVersion: v1
+kind: Service
+metadata:
+  name: orders
+  namespace: shopfront
+  labels:
+    app.kubernetes.io/name: orders
+    app.kubernetes.io/part-of: shopfront
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: orders
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: catalog
+  namespace: shopfront
+  labels:
+    app.kubernetes.io/name: catalog
+    app.kubernetes.io/part-of: shopfront
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: catalog
+  ports:
+    - name: http
+      port: 8081
+      targetPort: http
+      protocol: TCP
+  # Prefer same-zone endpoints when available (Kubernetes 1.33+ GA): cuts cross-AZ data transfer.
+  trafficDistribution: PreferClose

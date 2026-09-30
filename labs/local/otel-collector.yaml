@@ -1,0 +1,47 @@
+# OpenTelemetry Collector (contrib) for the local shopfront stack. See labs/CONTRACT.md §6.
+# Services export OTLP over HTTP to http://otel-collector:4318; traces go to Jaeger, and the debug
+# exporter prints a one-line summary per batch so `docker compose logs otel-collector` shows flow.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # memory_limiter must be first: it refuses data instead of letting the collector be OOM-killed.
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 256
+    spike_limit_mib: 64
+  batch:
+    timeout: 2s
+    send_batch_size: 512
+
+exporters:
+  # Collector 0.161 renamed the gRPC OTLP exporter from "otlp" to "otlp_grpc" ("otlp" still works
+  # but logs a deprecation warning). Older collectors, including some ADOT releases, only know "otlp".
+  otlp_grpc/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+  debug:
+    verbosity: basic
+  # Optional: anything that pushes OTLP metrics to the collector is scraped from :8889.
+  prometheus:
+    endpoint: 0.0.0.0:8889
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_grpc/jaeger, debug]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [prometheus]
+  telemetry:
+    logs:
+      level: info

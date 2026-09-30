@@ -1,0 +1,144 @@
+# Helm values for the Jenkins controller on EKS (chart jenkins/jenkins 5.9.64, Jenkins 2.580.1 LTS).
+#
+#   helm repo add jenkins https://charts.jenkins.io && helm repo update
+#   kubectl create namespace jenkins && kubectl create namespace jenkins-agents
+#   helm upgrade --install jenkins jenkins/jenkins --version 5.9.64 -n jenkins \
+#     -f labs/pipelines/jenkins/jenkins-values.yaml \
+#     --set-file controller.JCasC.configScripts.shopfront=labs/pipelines/jenkins/jcasc.yaml
+#
+# Design (hub/08 L200 §2.3, L300 §2.5, L400 §2.4): one controller (Jenkins has no active/active), its
+# state on an encrypted gp3 volume that is snapshotted daily (DR = restore the PVC snapshot and let
+# JCasC re-apply configuration), all builds on ephemeral agent pods in the jenkins-agents namespace,
+# AWS access through Pod Identity on the agent ServiceAccount (never on the controller).
+controller:
+  image:
+    repository: docker.io/jenkins/jenkins
+    tag: 2.580.1-lts-jdk21
+  numExecutors: 0
+  executorMode: EXCLUSIVE
+  resources:
+    requests: { cpu: 500m, memory: 2Gi }
+    limits: { memory: 4Gi }
+  javaOpts: >-
+    -XX:MaxRAMPercentage=70 -XX:+UseG1GC -Djenkins.install.runSetupWizard=false
+    -Dhudson.model.DirectoryBrowserSupport.CSP="sandbox; default-src 'none'; img-src 'self'; style-src 'self';"
+  containerSecurityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    readOnlyRootFilesystem: false        # Jenkins writes under /var/jenkins_home and /tmp
+    allowPrivilegeEscalation: false
+    capabilities: { drop: [ALL] }
+  podSecurityContextOverride:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 1000
+    seccompProfile: { type: RuntimeDefault }
+  # Pinned plugin set; the chart installs them at start (or bake them into a custom image for faster,
+  # reproducible restarts - the recommended production path).
+  installPlugins:
+    - kubernetes:4557.ve746270f672f
+    - workflow-aggregator:608.v67378e9d3db_1
+    - git:5.10.1
+    - configuration-as-code:2130.v3ef02f16a_34b_
+    - job-dsl:3732.v9a_c49a_61a_313
+    - github-branch-source:1983.vfa_27ed961853
+    - oic-auth:4.718.ve731df6ca_88a_
+    - role-strategy:918.v91e5468d8db_2
+    - credentials-binding:728.v902a_273b_8947
+    - timestamper:1.30
+    - ansicolor:542.v03d235fee02d
+    - aws-secrets-manager-secret-source:2.87.v49cc86c50c3b_
+    - prometheus:860.v532442b_44e9a_
+    - authorize-project:534.v2f208c45e11c
+  installLatestPlugins: false
+  installLatestSpecifiedPlugins: false
+  overwritePlugins: true
+
+  JCasC:
+    defaultConfig: false                # the chart's default script conflicts with jcasc.yaml
+    configScripts: {}                   # jcasc.yaml is injected with --set-file (see the header)
+    securityRealm: ""                   # defined in jcasc.yaml
+    authorizationStrategy: ""
+  # CasC ${VARIABLES} come from the Secrets Manager secret source plugin (agent-less: the controller reads
+  # them with its own Pod Identity role scoped to shopfront/jenkins/*) or from this Kubernetes Secret.
+  containerEnv:
+    - name: AWS_REGION
+      value: us-east-1
+    - name: CASC_AWS_SECRETS_MANAGER_NAME_FILTER   # the secret-source plugin resolves ${VARIABLES} from these secrets
+      value: shopfront/jenkins/*
+  existingSecret: jenkins-casc-secrets  # OIDC_CLIENT_ID/SECRET, GITHUB_APP_ID/PRIVATE_KEY (created by ESO)
+
+  serviceType: ClusterIP
+  ingress:
+    enabled: true
+    ingressClassName: alb
+    hostName: jenkins.shopfront.example.com
+    annotations:
+      alb.ingress.kubernetes.io/scheme: internal         # reachable through the corporate network or VPN only
+      alb.ingress.kubernetes.io/target-type: ip
+      alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS": 443}]'
+      alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:us-east-1:123456789012:certificate/22222222-3333-4444-5555-66666666666a
+      alb.ingress.kubernetes.io/healthcheck-path: /login
+      alb.ingress.kubernetes.io/wafv2-acl-arn: arn:aws:wafv2:us-east-1:123456789012:regional/webacl/internal-tools/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+
+  prometheus:
+    enabled: true
+    serviceMonitorAdditionalLabels: {}
+  healthProbes: true
+  probes:
+    startupProbe:
+      failureThreshold: 60              # a large plugin set can take minutes to start
+      periodSeconds: 10
+  podDisruptionBudget:
+    enabled: false                      # a single replica: a PDB would block every node drain
+  nodeSelector:
+    workload: stable                    # on-demand pool; a Spot reclaim mid-build loses queue state
+  tolerations:
+    - key: workload
+      operator: Equal
+      value: stable
+      effect: NoSchedule
+  terminationGracePeriodSeconds: 120    # finish writing build records before SIGKILL
+
+persistence:
+  enabled: true
+  storageClass: gp3-encrypted           # EBS CSI StorageClass with encrypted: "true", type gp3
+  size: 50Gi
+  accessMode: ReadWriteOnce
+  annotations:
+    # Tag the volume so AWS Backup (or Data Lifecycle Manager) snapshots it daily: the DR plan.
+    ebs.csi.aws.com/volumeTags: backup=daily,Project=shopfront
+
+serviceAccount:
+  create: true
+  name: jenkins
+  annotations: {}                       # Pod Identity association jenkins/jenkins: secretsmanager:GetSecretValue on shopfront/jenkins/* and nothing else
+
+serviceAccountAgent:
+  create: true
+  name: jenkins-agent                   # Pod Identity association -> ECR push, CloudFormation deploy (least privilege)
+
+agent:
+  enabled: true
+  namespace: jenkins-agents
+  image:
+    repository: jenkins/inbound-agent
+    tag: 3391.va_37fa_a_305d6d-3-jdk21
+  podRetention: Never
+  idleMinutes: 0
+  connectTimeout: 100
+  containerCap: 40
+  websocket: false                      # JNLP over the 50000 tunnel Service; websocket avoids the extra port when the ALB is in front
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 512Mi }
+  runAsUser: 1000
+  runAsGroup: 1000
+  podTemplates: {}                      # templates live in jcasc.yaml and the Jenkinsfile
+
+rbac:
+  create: true
+  readSecrets: false
+
+backup:
+  enabled: false                        # volume snapshots + JCasC are the backup; see playbooks/dr/cluster-rebuild-runbook.md

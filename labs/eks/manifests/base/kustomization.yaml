@@ -1,0 +1,26 @@
+# Base: the complete shopfront system for Kubernetes. Overlays set replicas, image tags, endpoints
+# and the ALB certificate per environment. Render with `kubectl kustomize labs/eks/manifests/overlays/dev`.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespace.yaml
+  - serviceaccounts.yaml
+  - config.yaml
+  - job-db-migrate.yaml
+  - deployment-orders.yaml
+  - deployment-catalog.yaml
+  - deployment-workers.yaml
+  - services.yaml
+  - ingress.yaml
+  - hpa.yaml
+  - pdb.yaml
+  - networkpolicies.yaml
+  - scaledobject-fulfillment.yaml
+  - cronjob-report.yaml
+
+labels:
+  - pairs:
+      app.kubernetes.io/managed-by: kustomize
+    includeSelectors: false
+    includeTemplates: true

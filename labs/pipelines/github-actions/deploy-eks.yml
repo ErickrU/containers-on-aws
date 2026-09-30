@@ -1,0 +1,105 @@
+# Deploy to EKS the GitOps way: the pipeline never talks to the cluster. It resolves the digests that
+# ci.yml pushed, rewrites the image digests in the prod overlay, and opens a pull request. Argo CD
+# syncs the cluster from main once the PR is merged (labs/eks/gitops/). hub/08 L200 §2.6, L400 §2.2.
+#
+# Copy to .github/workflows/deploy-eks.yml. Needs: a deploy role with ecr:DescribeImages, and
+# `contents: write` + `pull-requests: write` for the PR (a GitHub App token is cleaner than GITHUB_TOKEN
+# when branch protection requires reviews from a different identity).
+name: deploy-eks (gitops bump)
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Image tag pushed by ci (sha-<7>)
+        required: true
+        default: sha-0000000
+      overlay:
+        description: Kustomize overlay to update
+        required: true
+        default: dev
+        type: choice
+        options: [dev, prod]
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  PROJECT: shopfront
+  REGISTRY: 123456789012.dkr.ecr.us-east-1.amazonaws.com
+
+jobs:
+  bump:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    name: bump image digests in overlays/${{ inputs.overlay || 'dev' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
+    env:
+      OVERLAY: ${{ inputs.overlay || 'dev' }}
+      IMAGE_TAG: ${{ inputs.image_tag || format('sha-{0}', github.event.workflow_run.head_sha) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: configure AWS credentials (OIDC, read-only ECR)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/shopfront-gitops-bump
+          role-session-name: gha-bump-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: install kustomize
+        run: |
+          curl -fsSL -o kustomize.tar.gz \
+            https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.8.1/kustomize_v5.8.1_linux_amd64.tar.gz
+          tar -xzf kustomize.tar.gz kustomize && sudo install -m 0755 kustomize /usr/local/bin/kustomize
+          kustomize version
+
+      - name: resolve tag -> digest for the four images and set them in the overlay
+        working-directory: labs/eks/manifests/overlays/${{ env.OVERLAY }}
+        run: |
+          tag="${IMAGE_TAG}"
+          if [[ "$tag" =~ ^sha-[0-9a-f]{40}$ ]]; then tag="sha-${tag:4:7}"; fi
+          for repo in orders catalog worker report-job; do
+            digest="$(aws ecr describe-images --repository-name "${PROJECT}/${repo}" --image-ids "imageTag=${tag}" \
+              --query 'imageDetails[0].imageDigest' --output text)"
+            [[ "$digest" == sha256:* ]] || { echo "no image ${PROJECT}/${repo}:${tag}"; exit 1; }
+            # Digests, not tags: the manifest states exactly what runs; a re-pushed tag cannot change it.
+            kustomize edit set image "${REGISTRY}/${PROJECT}/${repo}@${digest}"
+            echo "${repo} -> ${digest}"
+          done
+          git diff --stat
+
+      - name: render and validate the overlay
+        run: |
+          curl -fsSL -o kubeconform.tar.gz \
+            https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz
+          tar -xzf kubeconform.tar.gz kubeconform && sudo install -m 0755 kubeconform /usr/local/bin/kubeconform
+          kustomize build "labs/eks/manifests/overlays/${OVERLAY}" \
+            | kubeconform -strict -ignore-missing-schemas -summary \
+                -schema-location default \
+                -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+
+      - name: open a pull request with the bump
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          branch="deploy/${OVERLAY}-${IMAGE_TAG}"
+          git config user.name "shopfront-deploy-bot"
+          git config user.email "shopfront-deploy-bot@users.noreply.github.com"
+          git switch -c "$branch"
+          git add "labs/eks/manifests/overlays/${OVERLAY}/kustomization.yaml"
+          git commit -m "deploy(${OVERLAY}): shopfront images ${IMAGE_TAG}" \
+            -m "Digests resolved from ECR tag ${IMAGE_TAG}. Argo CD syncs after merge."
+          git push -u origin "$branch"
+          gh pr create --title "deploy(${OVERLAY}): shopfront ${IMAGE_TAG}" \
+            --body "Image digest bump for overlays/${OVERLAY}. Rendered manifests validated with kubeconform. Merge to let Argo CD sync." \
+            --label deploy --base main --head "$branch"

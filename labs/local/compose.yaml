@@ -1,0 +1,298 @@
+# shopfront, the whole system on one laptop. Contract: labs/CONTRACT.md (§9 lists these names).
+#
+#   make up        docker compose -f labs/local/compose.yaml up -d --build
+#   make smoke     labs/local/smoke.sh
+#   make report    docker compose -f labs/local/compose.yaml --profile jobs run --rm report-job
+#   make down      docker compose -f labs/local/compose.yaml --profile jobs down -v --remove-orphans
+#
+# Image tags are pinned; the digest of each tag as verified on 2026-09-30 is in the comment next
+# to it. The five application images are built from ../apps/* (never pulled) and run with the
+# same hardening the ECS task definitions and Kubernetes manifests apply: read-only root
+# filesystem, tmpfs /tmp, all capabilities dropped, no privilege escalation, non-root user.
+
+name: shopfront
+
+networks:
+  shopfront:
+    name: shopfront
+
+volumes:
+  postgres-data:
+
+x-hardening: &hardening
+  read_only: true
+  tmpfs:
+    - /tmp
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  networks:
+    - shopfront
+
+x-otel-env: &otel-env
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+  OTEL_RESOURCE_ATTRIBUTES: deployment.environment=local
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  SHUTDOWN_TIMEOUT_SECONDS: "20"
+
+x-sqs-env: &sqs-env
+  SQS_QUEUE_URL: http://elasticmq:9324/000000000000/orders-created
+  AWS_REGION: us-east-1
+  AWS_ENDPOINT_URL_SQS: http://elasticmq:9324   # standard SDK variable; ElasticMQ ignores credentials
+  AWS_ACCESS_KEY_ID: x                          # but the SDKs refuse to sign without some value
+  AWS_SECRET_ACCESS_KEY: x
+
+services:
+  # ---------------------------------------------------------------- stateful neighbours -------
+  postgres:
+    image: postgres:16.15-alpine # sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+    environment:
+      POSTGRES_DB: shopfront
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # Run once, on the first start of an empty data directory, in filename order.
+      - ./schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./seed.sql:/docker-entrypoint-initdb.d/02-seed.sql:ro
+    healthcheck:
+      # -h 127.0.0.1 forces TCP: the temporary server used by initdb listens on the socket only,
+      # so dependants do not start before the init scripts have run.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U app -d shopfront"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    networks:
+      - shopfront
+
+  # One-shot: re-applies schema + seed (both idempotent). This is what a migration task looks like
+  # on ECS (run-task before the deployment) or Kubernetes (Job / Argo CD PreSync hook).
+  db-migrate:
+    image: postgres:16.15-alpine # sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+    command: ["psql", "postgres://app:app@postgres:5432/shopfront", "-v", "ON_ERROR_STOP=1", "-f", "/sql/01-schema.sql", "-f", "/sql/02-seed.sql"]
+    volumes:
+      - ./schema.sql:/sql/01-schema.sql:ro
+      - ./seed.sql:/sql/02-seed.sql:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    networks:
+      - shopfront
+
+  valkey:
+    image: valkey/valkey:8.1.10-alpine # sha256:081c2f5cb575efc901aa80ff9cdbd1ec6a301682fd35e1ebb4b0990a4a4a8507
+    command: ["valkey-server", "--save", "", "--appendonly", "no", "--maxmemory", "64mb", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks:
+      - shopfront
+
+  kafka:
+    image: apache/kafka:3.9.1 # sha256:4ceccc577f03f51f6af8dbfda55194d0d892f4fa7913ffbded567ce3895622ed
+    environment:
+      # Single node, KRaft (no ZooKeeper): the same process is broker and controller.
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      # Clients inside the compose network reach the broker as kafka:9092. From the host you need
+      # "127.0.0.1 kafka" in /etc/hosts, or use `docker compose exec kafka /opt/kafka/bin/...`.
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: "3"
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: ["CMD", "/opt/kafka/bin/kafka-broker-api-versions.sh", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 15s
+      retries: 12
+      start_period: 20s
+    networks:
+      - shopfront
+
+  elasticmq:
+    image: softwaremill/elasticmq-native:1.6.16 # sha256:8383f29ad746c12981ca2128f689a4b4a93815235f1a7851d2f165316503d132
+    volumes:
+      - ./elasticmq.conf:/opt/elasticmq.conf:ro
+    ports:
+      - "9324:9324"   # SQS API
+      - "9325:9325"   # statistics UI
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "9324"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks:
+      - shopfront
+
+  # ---------------------------------------------------------------- telemetry -----------------
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.161.0 # sha256:fd328de2552466ad78385e1b1289c3f2402b1c45f265b252aab1955b42845ac1
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+    depends_on:
+      - jaeger
+    networks:
+      - shopfront
+    # distroless image: no shell, so no container healthcheck; the SDKs retry exports on their own.
+
+  jaeger:
+    image: jaegertracing/jaeger:2.21.0 # sha256:3d0ac795ff98aa04d1be04311d2dac6c25b4bfc8322dc02e53bc5b170c5018c3
+    # Jaeger v2 all-in-one defaults: OTLP on 4317/4318, in-memory storage, UI on 16686.
+    ports:
+      - "16686:16686"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:16686/"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks:
+      - shopfront
+
+  # ---------------------------------------------------------------- shopfront services --------
+  catalog:
+    build:
+      context: ../apps/catalog
+    image: shopfront/catalog:dev
+    <<: *hardening
+    environment:
+      <<: *otel-env
+      PORT: "8081"
+      DATABASE_URL: postgres://app:app@postgres:5432/shopfront
+      VALKEY_URL: redis://valkey:6379
+      CACHE_TTL_SECONDS: "60"
+      OTEL_SERVICE_NAME: catalog
+    ports:
+      - "8081:8081"
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+      valkey:
+        condition: service_healthy
+    stop_grace_period: 30s
+    # distroless image (no shell): no container healthcheck; the smoke test polls /readyz instead.
+
+  orders:
+    build:
+      context: ../apps/orders
+    image: shopfront/orders:dev
+    <<: *hardening
+    environment:
+      <<: [*otel-env, *sqs-env]
+      PORT: "8080"
+      DATABASE_URL: postgres://app:app@postgres:5432/shopfront
+      CATALOG_URL: http://catalog:8081
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC: orders.created
+      OTEL_SERVICE_NAME: orders
+    ports:
+      - "8080:8080"
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+      catalog:
+        condition: service_started
+      elasticmq:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    stop_grace_period: 30s
+
+  fulfillment-worker:
+    build:
+      context: ../apps/worker
+    image: shopfront/worker:dev
+    command: ["python", "-m", "worker.fulfillment"]
+    <<: *hardening
+    environment:
+      <<: [*otel-env, *sqs-env]
+      PORT: "8082"
+      DATABASE_URL: postgres://app:app@postgres:5432/shopfront
+      SQS_WAIT_TIME_SECONDS: "20"
+      SQS_MAX_MESSAGES: "10"
+      FAIL_EVERY_N: ${FAIL_EVERY_N:-0}   # FAIL_EVERY_N=1 make up  -> every message fails and lands in the DLQ
+      OTEL_SERVICE_NAME: fulfillment-worker
+    ports:
+      - "8082:8082"
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+      elasticmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8082/healthz', timeout=2).status == 200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+    stop_grace_period: 30s
+
+  analytics-consumer:
+    build:
+      context: ../apps/worker
+    image: shopfront/worker:dev
+    command: ["python", "-m", "worker.analytics"]
+    <<: *hardening
+    environment:
+      <<: *otel-env
+      PORT: "8083"
+      DATABASE_URL: postgres://app:app@postgres:5432/shopfront
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC: orders.created
+      KAFKA_GROUP_ID: analytics
+      OTEL_SERVICE_NAME: analytics-consumer
+    ports:
+      - "8083:8083"
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8083/healthz', timeout=2).status == 200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+    stop_grace_period: 30s
+
+  # Run-to-completion job, only with --profile jobs:
+  #   make report                                   previous UTC day
+  #   REPORT_DATE=$(date -u +%F) make report        today
+  report-job:
+    build:
+      context: ../apps/report-job
+    image: shopfront/report-job:dev
+    profiles: [jobs]
+    <<: *hardening
+    environment:
+      DATABASE_URL: postgres://app:app@postgres:5432/shopfront
+      REPORT_OUTPUT: file:///out
+      REPORT_DATE: ${REPORT_DATE:-}
+      AWS_REGION: us-east-1
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    volumes:
+      - ./out:/out
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+    restart: "no"

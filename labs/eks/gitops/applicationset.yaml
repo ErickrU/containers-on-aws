@@ -1,0 +1,85 @@
+# One Application per target cluster, generated from a list (hub/08 L400 §2.2 covers the cluster
+# generator and hub-spoke topologies). Add a cluster by adding a list element and registering the
+# cluster in Argo CD; nothing else changes.
+#
+#   kubectl apply -f labs/eks/gitops/project.yaml -f labs/eks/gitops/applicationset.yaml
+#   argocd app list -p shopfront
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: shopfront
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: shopfront
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  generators:
+    - list:
+        elements:
+          - cluster: in-cluster
+            url: https://kubernetes.default.svc
+            environment: dev
+            region: us-east-1
+            overlay: dev
+            automated: "true"
+          - cluster: shopfront-prod
+            url: https://AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.gr7.us-east-1.eks.amazonaws.com
+            environment: prod
+            region: us-east-1
+            overlay: prod
+            automated: "false"          # prod syncs are manual (sync window + approval in the pipeline)
+          - cluster: shopfront-prod-dr
+            url: https://BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB.yl4.us-west-2.eks.amazonaws.com
+            environment: prod
+            region: us-west-2
+            overlay: prod
+            automated: "false"
+  # Applications are updated/created but never deleted by the set (a removed element leaves the
+  # Application orphaned for a human to delete), and finalizers keep resources on set deletion.
+  syncPolicy:
+    preserveResourcesOnDeletion: true
+    applicationsSync: create-update
+  template:
+    metadata:
+      name: 'shopfront-{{ .environment }}-{{ .region }}'
+      labels:
+        app.kubernetes.io/part-of: shopfront
+        environment: '{{ .environment }}'
+        region: '{{ .region }}'
+      annotations:
+        notifications.argoproj.io/subscribe.on-sync-failed.slack: shopfront-deploys
+        notifications.argoproj.io/subscribe.on-health-degraded.slack: shopfront-deploys
+    spec:
+      project: shopfront
+      source:
+        repoURL: https://github.com/ErickrU/containers-on-aws.git
+        targetRevision: main
+        path: 'labs/eks/manifests/overlays/{{ .overlay }}'
+      destination:
+        server: '{{ .url }}'
+        namespace: shopfront
+      syncPolicy:
+        syncOptions:
+          - ServerSideApply=true
+          - PrunePropagationPolicy=foreground
+        retry:
+          limit: 5
+          backoff:
+            duration: 10s
+            factor: 2
+            maxDuration: 3m
+      ignoreDifferences:
+        - group: apps
+          kind: Deployment
+          jsonPointers:
+            - /spec/replicas
+  templatePatch: |
+    {{- if eq .automated "true" }}
+    spec:
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+          allowEmpty: false
+    {{- end }}

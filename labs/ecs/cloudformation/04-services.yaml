@@ -1,0 +1,866 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  shopfront services on ECS Fargate: ALB with listener rules, target groups (ip, /readyz, 20 s
+  deregistration), task definitions for orders/catalog/fulfillment-worker/analytics-consumer with the
+  hardening fields from hub/03 L200, Service Connect, rolling deployments with circuit breaker and
+  alarm rollback, and Application Auto Scaling (CPU, requests per target, SQS backlog per task).
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: shopfront
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  ImageTag:
+    Type: String
+    Default: sha-0000000
+    Description: Tag or digest suffix pushed by CI (use @sha256:... for digests).
+  CertificateArn:
+    Type: String
+    Default: ''
+    Description: ACM certificate for HTTPS. Empty = HTTP-only listener (lab shortcut).
+  OrdersDesiredCount:
+    Type: Number
+    Default: 2
+  CatalogDesiredCount:
+    Type: Number
+    Default: 2
+  WorkerDesiredCount:
+    Type: Number
+    Default: 1
+  EnableAnalyticsConsumer:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Requires MSK (03-data EnableKafka=true) and KafkaBootstrapServers.
+  KafkaBootstrapServers:
+    Type: String
+    Default: ''
+    Description: MSK Serverless bootstrap string (port 9098) from get-bootstrap-brokers.
+  RollbackAlarmNames:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: CloudWatch alarm names (from 05-observability) that roll back deployments. Empty on first deploy.
+  OtelCollectorImage:
+    Type: String
+    Default: public.ecr.aws/aws-observability/aws-otel-collector:v0.50.0
+
+Conditions:
+  Https: !Not [!Equals [!Ref CertificateArn, '']]
+  Analytics: !Equals [!Ref EnableAnalyticsConsumer, 'true']
+  HasKafka: !Not [!Equals [!Ref KafkaBootstrapServers, '']]
+  HasRollbackAlarms: !Not [!Equals [!Join ['', !Ref RollbackAlarmNames], '']]
+
+Resources:
+  # ------------------------------------------------------------------ ALB ----------------------
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}'
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets: !Split
+        - ','
+        - !ImportValue
+          Fn::Sub: '${ProjectName}-${Environment}-PublicSubnetIds'
+      SecurityGroups:
+        - !ImportValue
+          Fn::Sub: '${ProjectName}-${Environment}-AlbSecurityGroupId'
+      LoadBalancerAttributes:
+        - { Key: idle_timeout.timeout_seconds, Value: '60' }
+        - { Key: routing.http.drop_invalid_header_fields.enabled, Value: 'true' }
+        - { Key: deletion_protection.enabled, Value: 'false' }
+
+  OrdersTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-orders'
+      VpcId: !ImportValue
+        Fn::Sub: '${ProjectName}-${Environment}-VpcId'
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8080
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /readyz
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: { HttpCode: '200' }
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: '20' }
+        - { Key: load_balancing.algorithm.type, Value: least_outstanding_requests }
+
+  CatalogTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-catalog'
+      VpcId: !ImportValue
+        Fn::Sub: '${ProjectName}-${Environment}-VpcId'
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8081
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /readyz
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: { HttpCode: '200' }
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: '20' }
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions: !If
+        - Https
+        - - Type: redirect
+            RedirectConfig: { Protocol: HTTPS, Port: '443', StatusCode: HTTP_301 }
+        - - Type: fixed-response
+            FixedResponseConfig: { StatusCode: '404', ContentType: text/plain, MessageBody: no route }
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: Https
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates: [{ CertificateArn: !Ref CertificateArn }]
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig: { StatusCode: '404', ContentType: text/plain, MessageBody: no route }
+
+  OrdersRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !If [Https, !Ref HttpsListener, !Ref HttpListener]
+      Priority: 10
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig: { Values: ['/orders', '/orders/*'] }
+      Actions:
+        - { Type: forward, TargetGroupArn: !Ref OrdersTargetGroup }
+
+  CatalogRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !If [Https, !Ref HttpsListener, !Ref HttpListener]
+      Priority: 20
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig: { Values: ['/products', '/products/*'] }
+      Actions:
+        - { Type: forward, TargetGroupArn: !Ref CatalogTargetGroup }
+
+  # ------------------------------------------------------------------ task definitions --------
+  OrdersTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-${Environment}-orders'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform: { CpuArchitecture: ARM64, OperatingSystemFamily: LINUX }
+      Cpu: '512'
+      Memory: '1024'
+      ExecutionRoleArn: !ImportValue
+        Fn::Sub: '${ProjectName}-${Environment}-TaskExecutionRoleArn'
+      TaskRoleArn: !ImportValue
+        Fn::Sub: '${ProjectName}-${Environment}-OrdersTaskRoleArn'
+      EphemeralStorage: { SizeInGiB: 21 }
+      Volumes: [{ Name: tmp }]
+      ContainerDefinitions:
+        - Name: orders
+          Image: !Sub
+            - '${Registry}/orders:${ImageTag}'
+            - Registry: !ImportValue
+                Fn::Sub: '${ProjectName}-${Environment}-RegistryUri'
+          Essential: true
+          Cpu: 384
+          MemoryReservation: 512
+          PortMappings:
+            - { Name: http, ContainerPort: 8080, Protocol: tcp, AppProtocol: http }
+          Environment:
+            - { Name: PORT, Value: '8080' }
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+            - { Name: CATALOG_URL, Value: 'http://catalog:8081' }
+            - Name: SQS_QUEUE_URL
+              Value: !ImportValue
+                Fn::Sub: '${ProjectName}-${Environment}-OrdersQueueUrl'
+            - { Name: KAFKA_BROKERS, Value: !Ref KafkaBootstrapServers }
+            - { Name: KAFKA_TOPIC, Value: orders.created }
+            - { Name: KAFKA_SASL_IAM, Value: !If [HasKafka, 'true', 'false'] }
+            - { Name: OTEL_EXPORTER_OTLP_ENDPOINT, Value: 'http://127.0.0.1:4318' }
+            - { Name: OTEL_SERVICE_NAME, Value: orders }
+            - { Name: OTEL_RESOURCE_ATTRIBUTES, Value: !Sub 'deployment.environment=${Environment}' }
+            - { Name: SHUTDOWN_TIMEOUT_SECONDS, Value: '20' }
+            - { Name: NODE_OPTIONS, Value: '--max-old-space-size=384' }
+          Secrets:
+            - Name: DATABASE_URL
+              ValueFrom: !ImportValue
+                Fn::Sub: '${ProjectName}-${Environment}-DatabaseUrlSecretArn'
+          DependsOn:
+            - { ContainerName: otel-collector, Condition: HEALTHY }
+          StopTimeout: 30
+          User: '10001:10001'
+          ReadonlyRootFilesystem: true
+          LinuxParameters:
+            InitProcessEnabled: true
+            Capabilities: { Drop: [ALL] }
+          Ulimits:
+            - { Name: nofile, SoftLimit: 65536, HardLimit: 65536 }
+          MountPoints:
+            - { SourceVolume: tmp, ContainerPath: /tmp }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub '/${ProjectName}/${Environment}/orders'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+              mode: non-blocking
+              max-buffer-size: 25m
+        - Name: otel-collector
+          Image: !Ref OtelCollectorImage
+          Essential: false
+          Cpu: 128
+          MemoryReservation: 256
+          Command: ['--config=/etc/ecs/ecs-default-config.yaml']
+          HealthCheck:
+            Command: [CMD, /healthcheck]
+            Interval: 10
+            Timeout: 5
+            Retries: 5
+            StartPeriod: 10
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub '/${ProjectName}/${Environment}/otel'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: orders
+              mode: non-blocking
+              max-buffer-size: 10m
+
+  CatalogTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-${Environment}-catalog'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform: { CpuArchitecture: ARM64, OperatingSystemFamily: LINUX }
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !ImportValue
+        Fn::Sub: '${ProjectName}-${Environment}-TaskExecutionRoleArn'
+      TaskRoleArn: !ImportValue
+        Fn::Sub: '${ProjectName}-${Environment}-CatalogTaskRoleArn'
+      Volumes: [{ Name: tmp }]
+      ContainerDefinitions:
+        - Name: catalog
+          Image: !Sub
+            - '${Registry}/catalog:${ImageTag}'
+            - Registry: !ImportValue
+                Fn::Sub: '${ProjectName}-${Environment}-RegistryUri'
+          Essential: true
+          Cpu: 192
+          MemoryReservation: 256
+          PortMappings:
+            - { Name: http, ContainerPort: 8081, Protocol: tcp, AppProtocol: http }
+          Environment:
+            - { Name: PORT, Value: '8081' }
+            - Name: VALKEY_URL
+              Value: !Sub
+                - 'rediss://${Endpoint}:6379'
+                - Endpoint: !ImportValue
+                    Fn::Sub: '${ProjectName}-${Environment}-ValkeyEndpoint'
+            - { Name: CACHE_TTL_SECONDS, Value: '60' }
+            - { Name: OTEL_EXPORTER_OTLP_ENDPOINT, Value: 'http://127.0.0.1:4318' }
+            - { Name: OTEL_SERVICE_NAME, Value: catalog }
+            - { Name: OTEL_RESOURCE_ATTRIBUTES, Value: !Sub 'deployment.environment=${Environment}' }
+            - { Name: SHUTDOWN_TIMEOUT_SECONDS, Value: '20' }
+            - { Name: GOMEMLIMIT, Value: '200MiB' }
+            - { Name: GOMAXPROCS, Value: '1' }
+          Secrets:
+            - Name: DATABASE_URL
+              ValueFrom: !ImportValue
+                Fn::Sub: '${ProjectName}-${Environment}-DatabaseUrlSecretArn'
+          DependsOn:
+            - { ContainerName: otel-collector, Condition: HEALTHY }
+          StopTimeout: 30
+          User: '10001:10001'
+          ReadonlyRootFilesystem: true
+          LinuxParameters:
+            InitProcessEnabled: true
+            Capabilities: { Drop: [ALL] }
+          MountPoints:
+            - { SourceVolume: tmp, ContainerPath: /tmp }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub '/${ProjectName}/${Environment}/catalog'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+              mode: non-blocking
+              max-buffer-size: 25m
+        - Name: otel-collector
+          Image: !Ref OtelCollectorImage
+          Essential: false
+          Cpu: 64
+          MemoryReservation: 128
+          Command: ['--config=/etc/ecs/ecs-default-config.yaml']
+          HealthCheck:
+            Command: [CMD, /healthcheck]
+            Interval: 10
+            Timeout: 5
+            Retries: 5
+            StartPeriod: 10
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub '/${ProjectName}/${Environment}/otel'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: catalog
+              mode: non-blocking
+              max-buffer-size: 10m
+
+  WorkerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-${Environment}-fulfillment-worker'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform: { CpuArchitecture: ARM64, OperatingSystemFamily: LINUX }
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !ImportValue
+        Fn::Sub: '${ProjectName}-${Environment}-TaskExecutionRoleArn'
+      TaskRoleArn: !ImportValue
+        Fn::Sub: '${ProjectName}-${Environment}-WorkerTaskRoleArn'
+      Volumes: [{ Name: tmp }]
+      ContainerDefinitions:
+        - Name: worker
+          Image: !Sub
+            - '${Registry}/worker:${ImageTag}'
+            - Registry: !ImportValue
+                Fn::Sub: '${ProjectName}-${Environment}-RegistryUri'
+          Command: [python, -m, worker.fulfillment]
+          Essential: true
+          Cpu: 192
+          MemoryReservation: 256
+          PortMappings:
+            - { Name: http, ContainerPort: 8082, Protocol: tcp, AppProtocol: http }
+          Environment:
+            - { Name: PORT, Value: '8082' }
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+            - Name: SQS_QUEUE_URL
+              Value: !ImportValue
+                Fn::Sub: '${ProjectName}-${Environment}-OrdersQueueUrl'
+            - { Name: SQS_WAIT_TIME_SECONDS, Value: '20' }
+            - { Name: SQS_MAX_MESSAGES, Value: '10' }
+            - { Name: OTEL_EXPORTER_OTLP_ENDPOINT, Value: 'http://127.0.0.1:4318' }
+            - { Name: OTEL_SERVICE_NAME, Value: fulfillment-worker }
+            - { Name: OTEL_RESOURCE_ATTRIBUTES, Value: !Sub 'deployment.environment=${Environment}' }
+            - { Name: SHUTDOWN_TIMEOUT_SECONDS, Value: '20' }
+          Secrets:
+            - Name: DATABASE_URL
+              ValueFrom: !ImportValue
+                Fn::Sub: '${ProjectName}-${Environment}-DatabaseUrlSecretArn'
+          DependsOn:
+            - { ContainerName: otel-collector, Condition: HEALTHY }
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - python -c "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8082/healthz', timeout=2).status == 200 else 1)"
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 30
+          StopTimeout: 30
+          User: '10001:10001'
+          ReadonlyRootFilesystem: true
+          LinuxParameters:
+            InitProcessEnabled: true
+            Capabilities: { Drop: [ALL] }
+          MountPoints:
+            - { SourceVolume: tmp, ContainerPath: /tmp }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub '/${ProjectName}/${Environment}/fulfillment-worker'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+              mode: non-blocking
+              max-buffer-size: 25m
+        - Name: otel-collector
+          Image: !Ref OtelCollectorImage
+          Essential: false
+          Cpu: 64
+          MemoryReservation: 128
+          Command: ['--config=/etc/ecs/ecs-default-config.yaml']
+          HealthCheck:
+            Command: [CMD, /healthcheck]
+            Interval: 10
+            Timeout: 5
+            Retries: 5
+            StartPeriod: 10
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub '/${ProjectName}/${Environment}/otel'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: worker
+              mode: non-blocking
+              max-buffer-size: 10m
+
+  AnalyticsTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Condition: Analytics
+    Properties:
+      Family: !Sub '${ProjectName}-${Environment}-analytics-consumer'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform: { CpuArchitecture: ARM64, OperatingSystemFamily: LINUX }
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !ImportValue
+        Fn::Sub: '${ProjectName}-${Environment}-TaskExecutionRoleArn'
+      TaskRoleArn: !ImportValue
+        Fn::Sub: '${ProjectName}-${Environment}-WorkerTaskRoleArn'
+      Volumes: [{ Name: tmp }]
+      ContainerDefinitions:
+        - Name: analytics
+          Image: !Sub
+            - '${Registry}/worker:${ImageTag}'
+            - Registry: !ImportValue
+                Fn::Sub: '${ProjectName}-${Environment}-RegistryUri'
+          Command: [python, -m, worker.analytics]
+          Essential: true
+          Cpu: 192
+          MemoryReservation: 256
+          PortMappings:
+            - { Name: http, ContainerPort: 8083, Protocol: tcp, AppProtocol: http }
+          Environment:
+            - { Name: PORT, Value: '8083' }
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+            - { Name: KAFKA_BROKERS, Value: !Ref KafkaBootstrapServers }
+            - { Name: KAFKA_TOPIC, Value: orders.created }
+            - { Name: KAFKA_GROUP_ID, Value: analytics }
+            - { Name: KAFKA_SASL_IAM, Value: 'true' }
+            - { Name: OTEL_EXPORTER_OTLP_ENDPOINT, Value: 'http://127.0.0.1:4318' }
+            - { Name: OTEL_SERVICE_NAME, Value: analytics-consumer }
+            - { Name: OTEL_RESOURCE_ATTRIBUTES, Value: !Sub 'deployment.environment=${Environment}' }
+            - { Name: SHUTDOWN_TIMEOUT_SECONDS, Value: '20' }
+          Secrets:
+            - Name: DATABASE_URL
+              ValueFrom: !ImportValue
+                Fn::Sub: '${ProjectName}-${Environment}-DatabaseUrlSecretArn'
+          DependsOn:
+            - { ContainerName: otel-collector, Condition: HEALTHY }
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - python -c "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8083/healthz', timeout=2).status == 200 else 1)"
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 30
+          StopTimeout: 30
+          User: '10001:10001'
+          ReadonlyRootFilesystem: true
+          LinuxParameters:
+            InitProcessEnabled: true
+            Capabilities: { Drop: [ALL] }
+          MountPoints:
+            - { SourceVolume: tmp, ContainerPath: /tmp }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub '/${ProjectName}/${Environment}/analytics-consumer'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+              mode: non-blocking
+              max-buffer-size: 25m
+        - Name: otel-collector
+          Image: !Ref OtelCollectorImage
+          Essential: false
+          Cpu: 64
+          MemoryReservation: 128
+          Command: ['--config=/etc/ecs/ecs-default-config.yaml']
+          HealthCheck:
+            Command: [CMD, /healthcheck]
+            Interval: 10
+            Timeout: 5
+            Retries: 5
+            StartPeriod: 10
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub '/${ProjectName}/${Environment}/otel'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: analytics
+              mode: non-blocking
+              max-buffer-size: 10m
+
+  # ------------------------------------------------------------------ one-off migration -------
+  # Lab shortcut for applying labs/local/schema.sql and seed.sql: deploy.sh runs this task once with
+  # a command override that pipes the SQL into psql. A production pipeline runs a migration tool
+  # (Flyway, Liquibase, Alembic, golang-migrate) as a versioned step instead (hub/08 L300 §2.5).
+  MigrateLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/${ProjectName}/${Environment}/db-migrate'
+      RetentionInDays: 30
+
+  MigrateTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-${Environment}-db-migrate'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform: { CpuArchitecture: ARM64, OperatingSystemFamily: LINUX }
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !ImportValue
+        Fn::Sub: '${ProjectName}-${Environment}-TaskExecutionRoleArn'
+      Volumes: [{ Name: tmp }]
+      ContainerDefinitions:
+        - Name: psql
+          Image: public.ecr.aws/docker/library/postgres:16-alpine
+          Essential: true
+          Command: [psql, --version]
+          Environment:
+            - { Name: HOME, Value: /tmp }
+            - { Name: PGCONNECT_TIMEOUT, Value: '10' }
+          Secrets:
+            - Name: DATABASE_URL
+              ValueFrom: !ImportValue
+                Fn::Sub: '${ProjectName}-${Environment}-DatabaseUrlSecretArn'
+          User: '10001:10001'
+          ReadonlyRootFilesystem: true
+          LinuxParameters:
+            InitProcessEnabled: true
+            Capabilities: { Drop: [ALL] }
+          MountPoints:
+            - { SourceVolume: tmp, ContainerPath: /tmp }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref MigrateLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  # ------------------------------------------------------------------ services ----------------
+  OrdersService:
+    Type: AWS::ECS::Service
+    DependsOn: OrdersRule
+    Properties:
+      ServiceName: orders
+      Cluster: !ImportValue
+        Fn::Sub: '${ProjectName}-${Environment}-ClusterName'
+      TaskDefinition: !Ref OrdersTaskDefinition
+      DesiredCount: !Ref OrdersDesiredCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      EnableExecuteCommand: true
+      PropagateTags: SERVICE
+      AvailabilityZoneRebalancing: ENABLED
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentController: { Type: ECS }
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+        Alarms: !If
+          - HasRollbackAlarms
+          - { AlarmNames: !Ref RollbackAlarmNames, Enable: true, Rollback: true }
+          - !Ref AWS::NoValue
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !Split
+            - ','
+            - !ImportValue
+              Fn::Sub: '${ProjectName}-${Environment}-PrivateSubnetIds'
+          SecurityGroups:
+            - !ImportValue
+              Fn::Sub: '${ProjectName}-${Environment}-ServicesSecurityGroupId'
+      LoadBalancers:
+        - { TargetGroupArn: !Ref OrdersTargetGroup, ContainerName: orders, ContainerPort: 8080 }
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace: !ImportValue
+          Fn::Sub: '${ProjectName}-${Environment}-NamespaceArn'
+        Services:
+          - PortName: http
+            DiscoveryName: orders
+            ClientAliases: [{ Port: 8080, DnsName: orders }]
+            Timeout: { IdleTimeoutSeconds: 300, PerRequestTimeoutSeconds: 30 }
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group: !Sub '/${ProjectName}/${Environment}/service-connect'
+            awslogs-region: !Ref AWS::Region
+            awslogs-stream-prefix: orders
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  CatalogService:
+    Type: AWS::ECS::Service
+    DependsOn: CatalogRule
+    Properties:
+      ServiceName: catalog
+      Cluster: !ImportValue
+        Fn::Sub: '${ProjectName}-${Environment}-ClusterName'
+      TaskDefinition: !Ref CatalogTaskDefinition
+      DesiredCount: !Ref CatalogDesiredCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      EnableExecuteCommand: true
+      PropagateTags: SERVICE
+      AvailabilityZoneRebalancing: ENABLED
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentController: { Type: ECS }
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !Split
+            - ','
+            - !ImportValue
+              Fn::Sub: '${ProjectName}-${Environment}-PrivateSubnetIds'
+          SecurityGroups:
+            - !ImportValue
+              Fn::Sub: '${ProjectName}-${Environment}-ServicesSecurityGroupId'
+      LoadBalancers:
+        - { TargetGroupArn: !Ref CatalogTargetGroup, ContainerName: catalog, ContainerPort: 8081 }
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace: !ImportValue
+          Fn::Sub: '${ProjectName}-${Environment}-NamespaceArn'
+        Services:
+          - PortName: http
+            DiscoveryName: catalog
+            ClientAliases: [{ Port: 8081, DnsName: catalog }]
+            Timeout: { IdleTimeoutSeconds: 300, PerRequestTimeoutSeconds: 10 }
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group: !Sub '/${ProjectName}/${Environment}/service-connect'
+            awslogs-region: !Ref AWS::Region
+            awslogs-stream-prefix: catalog
+
+  WorkerService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: fulfillment-worker
+      Cluster: !ImportValue
+        Fn::Sub: '${ProjectName}-${Environment}-ClusterName'
+      TaskDefinition: !Ref WorkerTaskDefinition
+      DesiredCount: !Ref WorkerDesiredCount
+      CapacityProviderStrategy:
+        - { CapacityProvider: FARGATE, Base: 1, Weight: 1 }
+        - { CapacityProvider: FARGATE_SPOT, Weight: 3 }
+      PlatformVersion: LATEST
+      EnableExecuteCommand: true
+      PropagateTags: SERVICE
+      AvailabilityZoneRebalancing: ENABLED
+      DeploymentController: { Type: ECS }
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !Split
+            - ','
+            - !ImportValue
+              Fn::Sub: '${ProjectName}-${Environment}-PrivateSubnetIds'
+          SecurityGroups:
+            - !ImportValue
+              Fn::Sub: '${ProjectName}-${Environment}-ServicesSecurityGroupId'
+      # Client-only Service Connect membership: can call orders/catalog by alias, exposes nothing.
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace: !ImportValue
+          Fn::Sub: '${ProjectName}-${Environment}-NamespaceArn'
+
+  AnalyticsService:
+    Type: AWS::ECS::Service
+    Condition: Analytics
+    Properties:
+      ServiceName: analytics-consumer
+      Cluster: !ImportValue
+        Fn::Sub: '${ProjectName}-${Environment}-ClusterName'
+      TaskDefinition: !Ref AnalyticsTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      EnableExecuteCommand: true
+      PropagateTags: SERVICE
+      DeploymentController: { Type: ECS }
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 0
+        MaximumPercent: 100
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !Split
+            - ','
+            - !ImportValue
+              Fn::Sub: '${ProjectName}-${Environment}-PrivateSubnetIds'
+          SecurityGroups:
+            - !ImportValue
+              Fn::Sub: '${ProjectName}-${Environment}-ServicesSecurityGroupId'
+
+  # ------------------------------------------------------------------ auto scaling ------------
+  OrdersScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      ServiceNamespace: ecs
+      ScalableDimension: ecs:service:DesiredCount
+      ResourceId: !Sub
+        - 'service/${ClusterName}/${OrdersService.Name}'
+        - ClusterName: !ImportValue
+            Fn::Sub: '${ProjectName}-${Environment}-ClusterName'
+      MinCapacity: !Ref OrdersDesiredCount
+      MaxCapacity: 20
+      RoleARN: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService'
+
+  OrdersCpuPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub '${ProjectName}-${Environment}-orders-cpu60'
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref OrdersScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 60
+        PredefinedMetricSpecification: { PredefinedMetricType: ECSServiceAverageCPUUtilization }
+        ScaleOutCooldown: 60
+        ScaleInCooldown: 180
+
+  OrdersRequestsPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub '${ProjectName}-${Environment}-orders-rpt'
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref OrdersScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 500
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ALBRequestCountPerTarget
+          ResourceLabel: !Sub '${LoadBalancer.LoadBalancerFullName}/${OrdersTargetGroup.TargetGroupFullName}'
+        ScaleOutCooldown: 60
+        ScaleInCooldown: 180
+
+  CatalogScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      ServiceNamespace: ecs
+      ScalableDimension: ecs:service:DesiredCount
+      ResourceId: !Sub
+        - 'service/${ClusterName}/${CatalogService.Name}'
+        - ClusterName: !ImportValue
+            Fn::Sub: '${ProjectName}-${Environment}-ClusterName'
+      MinCapacity: !Ref CatalogDesiredCount
+      MaxCapacity: 20
+      RoleARN: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService'
+
+  CatalogCpuPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub '${ProjectName}-${Environment}-catalog-cpu60'
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref CatalogScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 60
+        PredefinedMetricSpecification: { PredefinedMetricType: ECSServiceAverageCPUUtilization }
+        ScaleOutCooldown: 60
+        ScaleInCooldown: 180
+
+  WorkerScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      ServiceNamespace: ecs
+      ScalableDimension: ecs:service:DesiredCount
+      ResourceId: !Sub
+        - 'service/${ClusterName}/${WorkerService.Name}'
+        - ClusterName: !ImportValue
+            Fn::Sub: '${ProjectName}-${Environment}-ClusterName'
+      MinCapacity: !Ref WorkerDesiredCount
+      MaxCapacity: 20
+      RoleARN: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService'
+
+  # Backlog per task: visible messages divided by running tasks (Container Insights). Target 100.
+  WorkerBacklogPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub '${ProjectName}-${Environment}-worker-backlog-per-task'
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref WorkerScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 100
+        ScaleOutCooldown: 60
+        ScaleInCooldown: 300
+        CustomizedMetricSpecification:
+          Metrics:
+            - Id: visible
+              ReturnData: false
+              MetricStat:
+                Stat: Sum
+                Metric:
+                  Namespace: AWS/SQS
+                  MetricName: ApproximateNumberOfMessagesVisible
+                  Dimensions:
+                    - Name: QueueName
+                      Value: !ImportValue
+                        Fn::Sub: '${ProjectName}-${Environment}-OrdersQueueName'
+            - Id: running
+              ReturnData: false
+              MetricStat:
+                Stat: Average
+                Metric:
+                  Namespace: ECS/ContainerInsights
+                  MetricName: RunningTaskCount
+                  Dimensions:
+                    - Name: ClusterName
+                      Value: !ImportValue
+                        Fn::Sub: '${ProjectName}-${Environment}-ClusterName'
+                    - { Name: ServiceName, Value: fulfillment-worker }
+            - Id: backlog
+              ReturnData: true
+              Label: backlog per task
+              Expression: 'IF(running > 0, visible / running, visible)'
+
+Outputs:
+  LoadBalancerDnsName:
+    Value: !GetAtt LoadBalancer.DNSName
+    Export: { Name: !Sub '${ProjectName}-${Environment}-AlbDnsName' }
+  LoadBalancerFullName:
+    Value: !GetAtt LoadBalancer.LoadBalancerFullName
+    Export: { Name: !Sub '${ProjectName}-${Environment}-AlbFullName' }
+  OrdersTargetGroupFullName:
+    Value: !GetAtt OrdersTargetGroup.TargetGroupFullName
+    Export: { Name: !Sub '${ProjectName}-${Environment}-OrdersTgFullName' }
+  CatalogTargetGroupFullName:
+    Value: !GetAtt CatalogTargetGroup.TargetGroupFullName
+    Export: { Name: !Sub '${ProjectName}-${Environment}-CatalogTgFullName' }
+  OrdersServiceName:
+    Value: !GetAtt OrdersService.Name
+  WorkerServiceName:
+    Value: !GetAtt WorkerService.Name
+  MigrateTaskDefinitionArn:
+    Description: Used by deploy.sh migrate to apply schema.sql and seed.sql through a one-off task.
+    Value: !Ref MigrateTaskDefinition

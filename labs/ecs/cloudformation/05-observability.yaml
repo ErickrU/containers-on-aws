@@ -1,0 +1,719 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  shopfront observability on ECS: SNS alert topic, the CloudWatch alarms that hub/07 L300 calls the
+  minimum set (5xx ratio via metric math, p99 latency, unhealthy targets, running below desired,
+  CPU and memory, SQS age and DLQ depth, Aurora capacity), a composite "orders unhealthy" alarm,
+  EventBridge capture of ECS task/deployment/service events into a log group, and a starter
+  dashboard. Exports the alarm names that 04-services uses for deployment rollback.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: shopfront
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: Optional e-mail subscription for the alert topic (confirm the subscription mail).
+  OrdersP99LatencyThresholdSeconds:
+    Type: Number
+    Default: 1.0
+    Description: p99 TargetResponseTime above which the orders service is considered slow.
+  Orders5xxPercentThreshold:
+    Type: Number
+    Default: 5
+    Description: Percentage of orders requests answered with a target 5xx that trips the alarm.
+  QueueAgeThresholdSeconds:
+    Type: Number
+    Default: 300
+    Description: ApproximateAgeOfOldestMessage above which fulfillment is falling behind.
+  EventLogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [7, 14, 30, 60, 90, 180, 365]
+
+Conditions:
+  HasEmail: !Not [!Equals [!Ref AlertEmail, '']]
+
+Resources:
+  # ------------------------------------------------------------------ notifications -----------
+  # Not encrypted with the AWS-managed SNS key on purpose: CloudWatch alarms cannot publish to a
+  # topic encrypted with alias/aws/sns. Use a customer-managed key with a key policy for
+  # cloudwatch.amazonaws.com when you need encryption at rest for alert payloads.
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}-alerts'
+      DisplayName: !Sub '${ProjectName} ${Environment} alerts'
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  AlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref AlertTopic]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudWatchAlarms
+            Effect: Allow
+            Principal: { Service: cloudwatch.amazonaws.com }
+            Action: sns:Publish
+            Resource: !Ref AlertTopic
+            Condition:
+              StringEquals: { 'aws:SourceAccount': !Ref AWS::AccountId }
+          - Sid: AllowEventBridgeRules
+            Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sns:Publish
+            Resource: !Ref AlertTopic
+            Condition:
+              StringEquals: { 'aws:SourceAccount': !Ref AWS::AccountId }
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ------------------------------------------------------------------ ALB / orders ------------
+  # Ratio, not count: 10 errors on 100 requests is an incident, 10 errors on 100 000 is noise.
+  Orders5xxRatioAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-orders-5xx-ratio'
+      AlarmDescription: Percentage of orders requests answered with a target 5xx (3 of 5 minutes).
+      Metrics:
+        - Id: e5xx
+          ReturnData: false
+          MetricStat:
+            Period: 60
+            Stat: Sum
+            Metric:
+              Namespace: AWS/ApplicationELB
+              MetricName: HTTPCode_Target_5XX_Count
+              Dimensions:
+                - Name: LoadBalancer
+                  Value: !ImportValue
+                    Fn::Sub: '${ProjectName}-${Environment}-AlbFullName'
+                - Name: TargetGroup
+                  Value: !ImportValue
+                    Fn::Sub: '${ProjectName}-${Environment}-OrdersTgFullName'
+        - Id: req
+          ReturnData: false
+          MetricStat:
+            Period: 60
+            Stat: Sum
+            Metric:
+              Namespace: AWS/ApplicationELB
+              MetricName: RequestCount
+              Dimensions:
+                - Name: LoadBalancer
+                  Value: !ImportValue
+                    Fn::Sub: '${ProjectName}-${Environment}-AlbFullName'
+                - Name: TargetGroup
+                  Value: !ImportValue
+                    Fn::Sub: '${ProjectName}-${Environment}-OrdersTgFullName'
+        - Id: ratio
+          ReturnData: true
+          Label: orders target 5xx percent
+          Expression: 'IF(req > 0, 100 * FILL(e5xx, 0) / req, 0)'
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 3
+      Threshold: !Ref Orders5xxPercentThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  OrdersP99LatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-orders-p99-latency'
+      AlarmDescription: p99 TargetResponseTime of the orders target group (3 of 5 minutes).
+      Namespace: AWS/ApplicationELB
+      MetricName: TargetResponseTime
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !ImportValue
+            Fn::Sub: '${ProjectName}-${Environment}-AlbFullName'
+        - Name: TargetGroup
+          Value: !ImportValue
+            Fn::Sub: '${ProjectName}-${Environment}-OrdersTgFullName'
+      ExtendedStatistic: p99
+      Period: 60
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 3
+      Threshold: !Ref OrdersP99LatencyThresholdSeconds
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  OrdersUnhealthyTargetsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-orders-unhealthy-targets'
+      AlarmDescription: At least one orders target failed /readyz for 2 of 3 minutes.
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !ImportValue
+            Fn::Sub: '${ProjectName}-${Environment}-AlbFullName'
+        - Name: TargetGroup
+          Value: !ImportValue
+            Fn::Sub: '${ProjectName}-${Environment}-OrdersTgFullName'
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  CatalogUnhealthyTargetsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-catalog-unhealthy-targets'
+      AlarmDescription: At least one catalog target failed /readyz for 2 of 3 minutes.
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !ImportValue
+            Fn::Sub: '${ProjectName}-${Environment}-AlbFullName'
+        - Name: TargetGroup
+          Value: !ImportValue
+            Fn::Sub: '${ProjectName}-${Environment}-CatalogTgFullName'
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  # ELB-generated 5xx (502/503/504 produced by the load balancer itself) are a different failure
+  # class from target 5xx: no healthy target, connection refused, or a target closed the socket.
+  AlbElb5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-alb-elb-5xx'
+      AlarmDescription: The ALB itself generated more than 10 5xx responses per minute for 3 of 5 minutes.
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_ELB_5XX_Count
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !ImportValue
+            Fn::Sub: '${ProjectName}-${Environment}-AlbFullName'
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 3
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  # ------------------------------------------------------------------ ECS services ------------
+  OrdersRunningBelowDesiredAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-orders-running-below-desired'
+      AlarmDescription: Container Insights shows fewer running orders tasks than desired for 5 minutes.
+      Metrics:
+        - Id: desired
+          ReturnData: false
+          MetricStat:
+            Period: 60
+            Stat: Average
+            Metric:
+              Namespace: ECS/ContainerInsights
+              MetricName: DesiredTaskCount
+              Dimensions:
+                - Name: ClusterName
+                  Value: !ImportValue
+                    Fn::Sub: '${ProjectName}-${Environment}-ClusterName'
+                - { Name: ServiceName, Value: orders }
+        - Id: running
+          ReturnData: false
+          MetricStat:
+            Period: 60
+            Stat: Average
+            Metric:
+              Namespace: ECS/ContainerInsights
+              MetricName: RunningTaskCount
+              Dimensions:
+                - Name: ClusterName
+                  Value: !ImportValue
+                    Fn::Sub: '${ProjectName}-${Environment}-ClusterName'
+                - { Name: ServiceName, Value: orders }
+        - Id: gap
+          ReturnData: true
+          Label: desired minus running
+          Expression: 'desired - FILL(running, 0)'
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 5
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  OrdersCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-orders-cpu-high'
+      AlarmDescription: Average CPU of the orders service above 85 percent for 5 minutes (scaling target is 60).
+      Namespace: AWS/ECS
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: ClusterName
+          Value: !ImportValue
+            Fn::Sub: '${ProjectName}-${Environment}-ClusterName'
+        - { Name: ServiceName, Value: orders }
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 5
+      Threshold: 85
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  OrdersMemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-orders-memory-high'
+      AlarmDescription: Average memory of the orders service above 90 percent of the task limit (OOM kill is next).
+      Namespace: AWS/ECS
+      MetricName: MemoryUtilization
+      Dimensions:
+        - Name: ClusterName
+          Value: !ImportValue
+            Fn::Sub: '${ProjectName}-${Environment}-ClusterName'
+        - { Name: ServiceName, Value: orders }
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 3
+      Threshold: 90
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  CatalogRunningBelowDesiredAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-catalog-running-below-desired'
+      AlarmDescription: Container Insights shows fewer running catalog tasks than desired for 5 minutes.
+      Metrics:
+        - Id: desired
+          ReturnData: false
+          MetricStat:
+            Period: 60
+            Stat: Average
+            Metric:
+              Namespace: ECS/ContainerInsights
+              MetricName: DesiredTaskCount
+              Dimensions:
+                - Name: ClusterName
+                  Value: !ImportValue
+                    Fn::Sub: '${ProjectName}-${Environment}-ClusterName'
+                - { Name: ServiceName, Value: catalog }
+        - Id: running
+          ReturnData: false
+          MetricStat:
+            Period: 60
+            Stat: Average
+            Metric:
+              Namespace: ECS/ContainerInsights
+              MetricName: RunningTaskCount
+              Dimensions:
+                - Name: ClusterName
+                  Value: !ImportValue
+                    Fn::Sub: '${ProjectName}-${Environment}-ClusterName'
+                - { Name: ServiceName, Value: catalog }
+        - Id: gap
+          ReturnData: true
+          Label: desired minus running
+          Expression: 'desired - FILL(running, 0)'
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 5
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  # ------------------------------------------------------------------ queues ------------------
+  # Age, not depth: a deep queue with a fast consumer is fine; an old message means nobody is
+  # keeping up (or a poison message is being retried).
+  OrdersQueueAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-orders-queue-age'
+      AlarmDescription: Oldest visible message in the orders queue is older than the threshold for 3 minutes.
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+        - Name: QueueName
+          Value: !ImportValue
+            Fn::Sub: '${ProjectName}-${Environment}-OrdersQueueName'
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      Threshold: !Ref QueueAgeThresholdSeconds
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  OrdersDlqDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-orders-dlq-not-empty'
+      AlarmDescription: A message reached the dead-letter queue after exhausting its receive count.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !ImportValue
+            Fn::Sub: '${ProjectName}-${Environment}-OrdersDlqName'
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  # ------------------------------------------------------------------ data --------------------
+  AuroraCapacityAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-aurora-acu-utilization'
+      AlarmDescription: Aurora Serverless v2 is above 90 percent of its maximum ACU for 15 minutes; raise DbMaxCapacity or fix the query.
+      Namespace: AWS/RDS
+      MetricName: ACUUtilization
+      Dimensions:
+        - { Name: DBClusterIdentifier, Value: !Sub '${ProjectName}-${Environment}' }
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      Threshold: 90
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  # RDS Proxy pins a session when a client uses features the proxy cannot multiplex (SET, prepared
+  # statements without protocol support, advisory locks). Pinned sessions defeat pooling.
+  ProxyPinnedSessionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-rds-proxy-pinned-sessions'
+      AlarmDescription: More than 20 percent of proxy connections were pinned to a database connection.
+      Metrics:
+        - Id: pinned
+          ReturnData: false
+          MetricStat:
+            Period: 300
+            Stat: Average
+            Metric:
+              Namespace: AWS/RDS
+              MetricName: DatabaseConnectionsCurrentlySessionPinned
+              Dimensions:
+                - { Name: ProxyName, Value: !Sub '${ProjectName}-${Environment}' }
+        - Id: total
+          ReturnData: false
+          MetricStat:
+            Period: 300
+            Stat: Average
+            Metric:
+              Namespace: AWS/RDS
+              MetricName: DatabaseConnections
+              Dimensions:
+                - { Name: ProxyName, Value: !Sub '${ProjectName}-${Environment}' }
+        - Id: pct
+          ReturnData: true
+          Label: pinned percent
+          Expression: 'IF(total > 0, 100 * FILL(pinned, 0) / total, 0)'
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      Threshold: 20
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  # ------------------------------------------------------------------ composite ---------------
+  # One page instead of four when a bad deployment breaks orders. The individual alarms remain
+  # the rollback triggers for 04-services (see Outputs); this one is for humans.
+  OrdersUnhealthyComposite:
+    Type: AWS::CloudWatch::CompositeAlarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-orders-unhealthy'
+      AlarmDescription: Orders is unhealthy - 5xx ratio, p99 latency, unhealthy targets or missing tasks.
+      AlarmRule: !Sub >-
+        ALARM("${Orders5xxRatioAlarm}") OR ALARM("${OrdersP99LatencyAlarm}") OR
+        ALARM("${OrdersUnhealthyTargetsAlarm}") OR ALARM("${OrdersRunningBelowDesiredAlarm}")
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  # ------------------------------------------------------------------ ECS events --------------
+  # ECS emits task state changes, deployment state changes and service actions on the default
+  # event bus. Keeping them in a log group gives you `stoppedReason` history after the task is gone
+  # from `describe-tasks` (about one hour).
+  EcsEventsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/${ProjectName}/${Environment}/ecs-events'
+      RetentionInDays: !Ref EventLogRetentionDays
+
+  EcsEventsLogPolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: !Sub '${ProjectName}-${Environment}-eventbridge-to-logs'
+      PolicyDocument: !Sub
+        - |
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Sid": "TrustEventBridgeToStoreEvents",
+                "Effect": "Allow",
+                "Principal": { "Service": ["events.amazonaws.com", "delivery.logs.amazonaws.com"] },
+                "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+                "Resource": "${LogGroupArn}",
+                "Condition": {
+                  "ArnEquals": {
+                    "aws:SourceArn": ["${TaskRuleArn}", "${DeploymentRuleArn}", "${ServiceActionRuleArn}"]
+                  }
+                }
+              }
+            ]
+          }
+        - LogGroupArn: !GetAtt EcsEventsLogGroup.Arn
+          TaskRuleArn: !GetAtt EcsTaskStoppedRule.Arn
+          DeploymentRuleArn: !GetAtt EcsDeploymentRule.Arn
+          ServiceActionRuleArn: !GetAtt EcsServiceActionRule.Arn
+
+  EcsTaskStoppedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-ecs-task-stopped'
+      Description: Every STOPPED task of the shopfront cluster, with stopCode and stoppedReason.
+      State: ENABLED
+      EventPattern:
+        source: [aws.ecs]
+        detail-type: [ECS Task State Change]
+        detail:
+          clusterArn:
+            - !ImportValue
+              Fn::Sub: '${ProjectName}-${Environment}-ClusterArn'
+          lastStatus: [STOPPED]
+      Targets:
+        - Id: log-group
+          Arn: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${EcsEventsLogGroup}'
+
+  EcsDeploymentRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-ecs-deployment'
+      Description: Deployment lifecycle events; failures also go to the alert topic.
+      State: ENABLED
+      EventPattern:
+        source: [aws.ecs]
+        detail-type: [ECS Deployment State Change]
+        resources:
+          - prefix: !Sub 'arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:service/${ProjectName}-${Environment}/'
+      Targets:
+        - Id: log-group
+          Arn: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${EcsEventsLogGroup}'
+
+  EcsDeploymentFailedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-ecs-deployment-failed'
+      Description: Page when a rolling deployment fails (circuit breaker or alarm rollback).
+      State: ENABLED
+      EventPattern:
+        source: [aws.ecs]
+        detail-type: [ECS Deployment State Change]
+        resources:
+          - prefix: !Sub 'arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:service/${ProjectName}-${Environment}/'
+        detail:
+          eventName: [SERVICE_DEPLOYMENT_FAILED]
+      Targets:
+        - Id: alert-topic
+          Arn: !Ref AlertTopic
+          InputTransformer:
+            InputPathsMap:
+              service: $.resources[0]
+              reason: $.detail.reason
+            InputTemplate: '"ECS deployment failed for <service>: <reason>"'
+
+  EcsServiceActionRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-ecs-service-action'
+      Description: WARN and ERROR service actions (steady state lost, capacity unavailable, task placement failures).
+      State: ENABLED
+      EventPattern:
+        source: [aws.ecs]
+        detail-type: [ECS Service Action]
+        resources:
+          - prefix: !Sub 'arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:service/${ProjectName}-${Environment}/'
+        detail:
+          eventType: [WARN, ERROR]
+      Targets:
+        - Id: log-group
+          Arn: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${EcsEventsLogGroup}'
+
+  # ------------------------------------------------------------------ dashboard ---------------
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${Environment}'
+      DashboardBody: !Sub
+        - |
+          {
+            "widgets": [
+              {
+                "type": "metric", "x": 0, "y": 0, "width": 8, "height": 6,
+                "properties": {
+                  "title": "ALB requests and 5xx (per minute)", "region": "${AWS::Region}", "stat": "Sum", "period": 60,
+                  "metrics": [
+                    ["AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${Alb}"],
+                    [".", "HTTPCode_Target_5XX_Count", ".", "."],
+                    [".", "HTTPCode_ELB_5XX_Count", ".", "."]
+                  ]
+                }
+              },
+              {
+                "type": "metric", "x": 8, "y": 0, "width": 8, "height": 6,
+                "properties": {
+                  "title": "Orders latency p50 / p99 (s)", "region": "${AWS::Region}", "period": 60,
+                  "metrics": [
+                    ["AWS/ApplicationELB", "TargetResponseTime", "LoadBalancer", "${Alb}", "TargetGroup", "${OrdersTg}", {"stat": "p50"}],
+                    ["...", {"stat": "p99"}]
+                  ]
+                }
+              },
+              {
+                "type": "metric", "x": 16, "y": 0, "width": 8, "height": 6,
+                "properties": {
+                  "title": "Healthy / unhealthy targets", "region": "${AWS::Region}", "stat": "Maximum", "period": 60,
+                  "metrics": [
+                    ["AWS/ApplicationELB", "HealthyHostCount", "LoadBalancer", "${Alb}", "TargetGroup", "${OrdersTg}"],
+                    [".", "UnHealthyHostCount", ".", ".", ".", "."],
+                    [".", "HealthyHostCount", ".", ".", ".", "${CatalogTg}"],
+                    [".", "UnHealthyHostCount", ".", ".", ".", "."]
+                  ]
+                }
+              },
+              {
+                "type": "metric", "x": 0, "y": 6, "width": 8, "height": 6,
+                "properties": {
+                  "title": "ECS CPU / memory utilization (%)", "region": "${AWS::Region}", "stat": "Average", "period": 60,
+                  "metrics": [
+                    ["AWS/ECS", "CPUUtilization", "ClusterName", "${Cluster}", "ServiceName", "orders"],
+                    [".", "MemoryUtilization", ".", ".", ".", "."],
+                    [".", "CPUUtilization", ".", ".", ".", "catalog"],
+                    [".", "MemoryUtilization", ".", ".", ".", "."],
+                    [".", "CPUUtilization", ".", ".", ".", "fulfillment-worker"]
+                  ]
+                }
+              },
+              {
+                "type": "metric", "x": 8, "y": 6, "width": 8, "height": 6,
+                "properties": {
+                  "title": "Running vs desired tasks", "region": "${AWS::Region}", "stat": "Average", "period": 60,
+                  "metrics": [
+                    ["ECS/ContainerInsights", "RunningTaskCount", "ClusterName", "${Cluster}", "ServiceName", "orders"],
+                    [".", "DesiredTaskCount", ".", ".", ".", "."],
+                    [".", "RunningTaskCount", ".", ".", ".", "catalog"],
+                    [".", "DesiredTaskCount", ".", ".", ".", "."],
+                    [".", "RunningTaskCount", ".", ".", ".", "fulfillment-worker"],
+                    [".", "DesiredTaskCount", ".", ".", ".", "."]
+                  ]
+                }
+              },
+              {
+                "type": "metric", "x": 16, "y": 6, "width": 8, "height": 6,
+                "properties": {
+                  "title": "Orders queue: age of oldest (s), visible, DLQ", "region": "${AWS::Region}", "stat": "Maximum", "period": 60,
+                  "metrics": [
+                    ["AWS/SQS", "ApproximateAgeOfOldestMessage", "QueueName", "${Queue}"],
+                    [".", "ApproximateNumberOfMessagesVisible", ".", "."],
+                    [".", "ApproximateNumberOfMessagesVisible", ".", "${Dlq}"]
+                  ]
+                }
+              },
+              {
+                "type": "metric", "x": 0, "y": 12, "width": 12, "height": 6,
+                "properties": {
+                  "title": "Aurora ACU and connections", "region": "${AWS::Region}", "stat": "Average", "period": 60,
+                  "metrics": [
+                    ["AWS/RDS", "ServerlessDatabaseCapacity", "DBClusterIdentifier", "${ProjectName}-${Environment}"],
+                    [".", "ACUUtilization", ".", "."],
+                    [".", "DatabaseConnections", ".", "."]
+                  ]
+                }
+              },
+              {
+                "type": "log", "x": 12, "y": 12, "width": 12, "height": 6,
+                "properties": {
+                  "title": "Last stopped tasks (stopCode, stoppedReason)", "region": "${AWS::Region}",
+                  "query": "SOURCE '/${ProjectName}/${Environment}/ecs-events' | fields @timestamp, detail.group, detail.stopCode, detail.stoppedReason | filter `detail-type` = 'ECS Task State Change' | sort @timestamp desc | limit 20",
+                  "view": "table"
+                }
+              }
+            ]
+          }
+        - Alb: !ImportValue
+            Fn::Sub: '${ProjectName}-${Environment}-AlbFullName'
+          OrdersTg: !ImportValue
+            Fn::Sub: '${ProjectName}-${Environment}-OrdersTgFullName'
+          CatalogTg: !ImportValue
+            Fn::Sub: '${ProjectName}-${Environment}-CatalogTgFullName'
+          Cluster: !ImportValue
+            Fn::Sub: '${ProjectName}-${Environment}-ClusterName'
+          Queue: !ImportValue
+            Fn::Sub: '${ProjectName}-${Environment}-OrdersQueueName'
+          Dlq: !ImportValue
+            Fn::Sub: '${ProjectName}-${Environment}-OrdersDlqName'
+
+Outputs:
+  AlertTopicArn:
+    Value: !Ref AlertTopic
+    Export: { Name: !Sub '${ProjectName}-${Environment}-AlertTopicArn' }
+  RollbackAlarmNames:
+    Description: Pass to 04-services RollbackAlarmNames so a bad deployment rolls back on its own.
+    Value: !Join
+      - ','
+      - - !Ref Orders5xxRatioAlarm
+        - !Ref OrdersP99LatencyAlarm
+        - !Ref OrdersUnhealthyTargetsAlarm
+    Export: { Name: !Sub '${ProjectName}-${Environment}-RollbackAlarmNames' }
+  EcsEventsLogGroupName:
+    Value: !Ref EcsEventsLogGroup
+  DashboardUrl:
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${Dashboard}'

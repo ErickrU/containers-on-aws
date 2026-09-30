@@ -1,0 +1,226 @@
+# eksctl ClusterConfig for the shopfront lab on EKS standard (you manage the data plane).
+#
+#   eksctl create cluster -f labs/eks/cluster/eksctl-standard.yaml      # ~15 min control plane, ~5 min nodes
+#   eksctl delete cluster -f labs/eks/cluster/eksctl-standard.yaml
+#
+# What you get: a new VPC 10.42.0.0/16 (3 AZs, public + private subnets, one NAT gateway), a
+# Kubernetes 1.36 control plane with private+public endpoint and all five log types, access entries
+# as the only authentication mode, managed add-ons pinned to "latest" for the cluster version
+# (VPC CNI with prefix delegation and network policy, CoreDNS with add-on autoscaling, kube-proxy,
+# Pod Identity agent, EBS CSI, metrics-server, CloudWatch Observability), a Graviton managed node
+# group on AL2023 with IMDSv2 required and hop limit 1, and Pod Identity associations for the
+# controllers and the shopfront service accounts. Karpenter is installed separately
+# (labs/eks/addons/karpenter-values.yaml + labs/eks/cluster/karpenter-nodepool.yaml).
+#
+# Costs while running: control plane (hourly), 3 x m7g.large, NAT gateway, ALB created by the Ingress.
+# Verify current add-on versions with: aws eks describe-addon-versions --kubernetes-version 1.36
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: shopfront-dev
+  region: us-east-1
+  version: "1.36"
+  tags:
+    Project: shopfront
+    Environment: dev
+    ManagedBy: containers-on-aws/labs
+
+# To reuse the VPC from labs/ecs/cloudformation/01-network.yaml instead of creating one, replace the
+# `vpc` block with subnet ids (private = node subnets, EksControlPlaneSubnetIds = control plane):
+#   vpc:
+#     id: vpc-0123456789abcdef0
+#     subnets:
+#       private: { us-east-1a: { id: subnet-... }, us-east-1b: { id: subnet-... }, us-east-1c: { id: subnet-... } }
+#       public:  { us-east-1a: { id: subnet-... }, us-east-1b: { id: subnet-... }, us-east-1c: { id: subnet-... } }
+#     controlPlaneSubnetIDs: [subnet-..., subnet-...]     # the /28 subnets from 01-network
+vpc:
+  cidr: 10.42.0.0/16
+  nat:
+    gateway: Single          # HighlyAvailable (one per AZ) for anything beyond a lab
+  clusterEndpoints:
+    publicAccess: true       # tighten with publicAccessCIDRs or set false and use a bastion/VPN
+    privateAccess: true
+  publicAccessCIDRs: ["0.0.0.0/0"]
+
+kubernetesNetworkConfig:
+  ipFamily: IPv4             # IPv6 removes the IP-exhaustion problem; see hub/05 L300 §2.4
+
+accessConfig:
+  authenticationMode: API    # access entries only; no aws-auth ConfigMap
+  bootstrapClusterCreatorAdminPermissions: true
+  # accessEntries:
+  #   - principalARN: arn:aws:iam::123456789012:role/PlatformAdmins
+  #     accessPolicies:
+  #       - policyARN: arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy
+  #         accessScope: { type: cluster }
+  #   - principalARN: arn:aws:iam::123456789012:role/ShopfrontDevelopers
+  #     accessPolicies:
+  #       - policyARN: arn:aws:eks::aws:cluster-access-policy/AmazonEKSEditPolicy
+  #         accessScope: { type: namespace, namespaces: [shopfront] }
+
+cloudWatch:
+  clusterLogging:
+    enableTypes: [api, audit, authenticator, controllerManager, scheduler]
+    logRetentionInDays: 30
+
+iam:
+  withOIDC: true             # still needed for IRSA consumers (Fargate profiles, some charts)
+  # Pod Identity associations for the shopfront workloads. Roles are created by eksctl with the
+  # trust policy for pods.eks.amazonaws.com; the permissions are the least privilege each service needs.
+  podIdentityAssociations:
+    - namespace: shopfront
+      serviceAccountName: orders
+      roleName: shopfront-dev-eks-orders
+      permissionPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: [sqs:SendMessage, sqs:GetQueueAttributes]
+            Resource: arn:aws:sqs:us-east-1:123456789012:shopfront-dev-orders-created
+          - Effect: Allow
+            Action: [kafka-cluster:Connect, kafka-cluster:WriteData, kafka-cluster:DescribeTopic]
+            Resource: "*"
+    - namespace: shopfront
+      serviceAccountName: catalog
+      roleName: shopfront-dev-eks-catalog
+      permissionPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Deny            # catalog needs no AWS API; a role with an explicit deny documents that
+            Action: "*"
+            Resource: "*"
+    - namespace: shopfront
+      serviceAccountName: fulfillment-worker
+      roleName: shopfront-dev-eks-fulfillment-worker
+      permissionPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:ChangeMessageVisibility, sqs:GetQueueAttributes]
+            Resource: arn:aws:sqs:us-east-1:123456789012:shopfront-dev-orders-created
+    - namespace: shopfront
+      serviceAccountName: report-job
+      roleName: shopfront-dev-eks-report-job
+      permissionPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: [s3:PutObject, s3:AbortMultipartUpload]
+            Resource: arn:aws:s3:::shopfront-reports-dev-123456789012/daily/*
+    - namespace: external-secrets
+      serviceAccountName: external-secrets
+      roleName: shopfront-dev-eks-external-secrets
+      permissionPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: [secretsmanager:GetSecretValue, secretsmanager:DescribeSecret]
+            Resource: arn:aws:secretsmanager:us-east-1:123456789012:secret:shopfront/*
+    - namespace: kube-system
+      serviceAccountName: aws-load-balancer-controller
+      roleName: shopfront-dev-eks-aws-load-balancer-controller
+      wellKnownPolicies:
+        awsLoadBalancerController: true
+    - namespace: kube-system
+      serviceAccountName: karpenter
+      roleName: shopfront-dev-eks-karpenter
+      permissionPolicy:
+        Version: "2012-10-17"
+        Statement:
+          # Trimmed Karpenter controller policy; the full CloudFormation-managed policy is in the
+          # Karpenter getting-started guide. Enough for the lab NodePool in karpenter-nodepool.yaml.
+          - Effect: Allow
+            Action:
+              - ec2:CreateFleet
+              - ec2:CreateLaunchTemplate
+              - ec2:CreateTags
+              - ec2:DeleteLaunchTemplate
+              - ec2:Describe*
+              - ec2:RunInstances
+              - ec2:TerminateInstances
+              - pricing:GetProducts
+              - ssm:GetParameter
+              - iam:PassRole
+              - iam:CreateInstanceProfile
+              - iam:AddRoleToInstanceProfile
+              - iam:RemoveRoleFromInstanceProfile
+              - iam:DeleteInstanceProfile
+              - iam:GetInstanceProfile
+              - iam:TagInstanceProfile
+              - eks:DescribeCluster
+              - sqs:DeleteMessage
+              - sqs:GetQueueUrl
+              - sqs:ReceiveMessage
+            Resource: "*"
+
+addonsConfig:
+  autoApplyPodIdentityAssociations: true   # add-ons that support Pod Identity get an association
+
+addons:
+  - name: vpc-cni
+    version: latest
+    useDefaultPodIdentityAssociations: true
+    configurationValues: |-
+      env:
+        ENABLE_PREFIX_DELEGATION: "true"     # /28 prefixes per ENI slot: ~110 pods per m7g.large instead of 29
+        WARM_PREFIX_TARGET: "1"
+        AWS_VPC_K8S_CNI_EXTERNALSNAT: "false"
+      enableNetworkPolicy: "true"            # eBPF network policy agent (NetworkPolicy objects in base/)
+      nodeAgent:
+        enablePolicyEventLogs: "true"
+  - name: coredns
+    version: latest
+    configurationValues: |-
+      autoScaling:
+        enabled: true
+        minReplicas: 2
+        maxReplicas: 10
+      resources:
+        requests: { cpu: 100m, memory: 128Mi }
+        limits: { memory: 256Mi }
+  - name: kube-proxy
+    version: latest
+    configurationValues: |-
+      mode: iptables                         # ipvs or nftables: hub/04 L300 §2.5
+  - name: eks-pod-identity-agent
+    version: latest
+  - name: aws-ebs-csi-driver
+    version: latest
+    useDefaultPodIdentityAssociations: true
+  - name: metrics-server
+    version: latest
+  - name: amazon-cloudwatch-observability    # Container Insights with enhanced observability + Application Signals
+    version: latest
+    useDefaultPodIdentityAssociations: true
+
+managedNodeGroups:
+  - name: general-arm64
+    amiFamily: AmazonLinux2023
+    instanceTypes: [m7g.large, m7g.xlarge]
+    capacityType: ON_DEMAND
+    minSize: 2
+    desiredCapacity: 3
+    maxSize: 12
+    privateNetworking: true
+    volumeSize: 80
+    volumeType: gp3
+    volumeEncrypted: true
+    updateConfig:
+      maxUnavailablePercentage: 25
+    labels:
+      workload: general
+      karpenter.sh/controller: "true"          # Karpenter and other controllers pin here (see karpenter-values.yaml)
+    tags:
+      Project: shopfront
+      Environment: dev
+    disableIMDSv1: true                       # HttpTokens: required
+    disablePodIMDS: true                      # HttpPutResponseHopLimit: 1 - pods cannot reach 169.254.169.254
+    iam:
+      attachPolicyARNs:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPullOnly
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore   # Session Manager instead of SSH
+      # No AmazonEKS_CNI_Policy on the node role: the VPC CNI uses its Pod Identity association.
+    ssh:
+      allow: false

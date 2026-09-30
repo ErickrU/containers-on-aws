@@ -1,0 +1,44 @@
+# A single Argo CD Application for the dev overlay: the simplest GitOps shape (hub/08 L200 §2.6).
+# applicationset.yaml generalises this to one Application per cluster/environment.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: shopfront-dev
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: shopfront
+    environment: dev
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io   # cascade delete: removing the Application removes the resources
+spec:
+  project: shopfront
+  source:
+    repoURL: https://github.com/ErickrU/containers-on-aws.git
+    targetRevision: main
+    path: labs/eks/manifests/overlays/dev
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: shopfront
+  syncPolicy:
+    automated:
+      prune: true            # delete resources removed from git
+      selfHeal: true         # revert kubectl edits within ~3 minutes
+      allowEmpty: false      # refuse to prune everything if the path renders empty
+    syncOptions:
+      - CreateNamespace=false   # the namespace is in the manifests (PSA labels, readiness gate label)
+      - ServerSideApply=true    # large objects and field ownership without last-applied annotations
+      - PrunePropagationPolicy=foreground
+      - RespectIgnoreDifferences=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m
+  # The HPA and KEDA own spec.replicas at runtime; Argo CD must not fight them.
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas
+  revisionHistoryLimit: 10

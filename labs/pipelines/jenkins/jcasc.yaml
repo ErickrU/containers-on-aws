@@ -1,0 +1,170 @@
+# Jenkins Configuration as Code for a controller on EKS (hub/08 L200 §2.3, L300 §2.5). Loaded by the
+# Helm chart (jenkins-values.yaml -> controller.JCasC.configScripts) so the controller is rebuilt from
+# git, not from clicks. Secrets are referenced as ${VARIABLES} resolved by the CasC Secrets Manager
+# source or from Kubernetes Secrets mounted by the chart; none are written here.
+jenkins:
+  systemMessage: "shopfront CI - configured as code; changes made in the UI are overwritten on restart."
+  numExecutors: 0                      # the controller never runs builds
+  mode: EXCLUSIVE
+  scmCheckoutRetryCount: 2
+  disableRememberMe: false
+  markupFormatter: plainText
+
+  # Single sign-on through the corporate IdP. The OIDC plugin maps groups to Jenkins authorities.
+  securityRealm:
+    oic:
+      clientId: "${OIDC_CLIENT_ID}"
+      clientSecret: "${OIDC_CLIENT_SECRET}"
+      serverConfiguration:
+        wellKnown:
+          wellKnownOpenIDConfigurationUrl: https://login.example.com/.well-known/openid-configuration
+          scopesOverride: openid email profile groups
+      userNameField: preferred_username
+      groupsFieldName: groups
+      logoutFromOpenidProvider: true
+      escapeHatchEnabled: false
+  authorizationStrategy:
+    roleBased:
+      roles:
+        global:
+          - name: admin
+            description: platform team
+            permissions: [Overall/Administer]
+            entries:
+              - group: platform-admins
+          - name: developer
+            description: read, build, cancel on shopfront jobs
+            permissions:
+              - Overall/Read
+              - Job/Read
+              - Job/Build
+              - Job/Cancel
+              - Job/Workspace
+              - Run/Replay
+              - View/Read
+            entries:
+              - group: shopfront-developers
+  crumbIssuer:
+    standard:
+      excludeClientIPFromCrumb: true
+  remotingSecurity:
+    enabled: true
+
+  clouds:
+    - kubernetes:
+        name: eks
+        serverUrl: https://kubernetes.default.svc      # in-cluster; the controller's ServiceAccount has RBAC on the ci namespace
+        namespace: jenkins-agents
+        jenkinsUrl: http://jenkins.jenkins.svc.cluster.local:8080
+        jenkinsTunnel: jenkins-agent.jenkins.svc.cluster.local:50000
+        containerCapStr: "40"
+        maxRequestsPerHostStr: "64"
+        connectTimeout: 10
+        readTimeout: 20
+        retentionTimeout: 5             # minutes an idle agent pod lives
+        waitForPodSec: 600
+        podLabels:
+          - key: app.kubernetes.io/part-of
+            value: shopfront-ci
+        templates:
+          # Baseline template: the Jenkinsfile adds its own containers with `yaml:` and inherits this.
+          - name: default
+            namespace: jenkins-agents
+            label: default
+            serviceAccount: jenkins-agent
+            nodeUsageMode: NORMAL
+            idleMinutes: 0
+            podRetention: never
+            yamlMergeStrategy: merge
+            containers:
+              - name: jnlp
+                image: jenkins/inbound-agent:3391.va_37fa_a_305d6d-3-jdk21
+                alwaysPullImage: false
+                workingDir: /home/jenkins/agent
+                resourceRequestCpu: 100m
+                resourceRequestMemory: 256Mi
+                resourceLimitMemory: 512Mi
+            yaml: |
+              apiVersion: v1
+              kind: Pod
+              spec:
+                automountServiceAccountToken: false
+                securityContext:
+                  runAsNonRoot: true
+                  runAsUser: 1000
+                  fsGroup: 1000
+                  seccompProfile: { type: RuntimeDefault }
+                nodeSelector:
+                  workload: general
+
+unclassified:
+  location:
+    url: https://jenkins.shopfront.example.com/
+    adminAddress: platform@shopfront.example.com
+  globalLibraries:
+    libraries:
+      - name: shopfront-pipeline-lib      # shared steps: buildImage(), scanImage(), deployEcs()
+        defaultVersion: main
+        implicit: false
+        retriever:
+          modernSCM:
+            scm:
+              git:
+                remote: https://github.com/example/shopfront-pipeline-lib.git
+  gitHubPluginConfig:
+    hookUrl: https://jenkins.shopfront.example.com/github-webhook/
+  buildDiscarders:
+    configuredBuildDiscarders:
+      - simpleBuildDiscarder:
+          discarder:
+            logRotator:
+              numToKeepStr: "50"
+              artifactNumToKeepStr: "10"
+  timestamper:
+    allPipelines: true
+
+security:
+  queueItemAuthenticator:
+    authenticators:
+      - global:
+          strategy: triggeringUsersAuthorizationStrategy
+  scriptApproval:
+    approvedSignatures: []
+  apiToken:
+    creationOfLegacyTokenEnabled: false
+    tokenGenerationOnCreationEnabled: false
+    usageStatisticsEnabled: true
+
+credentials:
+  system:
+    domainCredentials:
+      - credentials:
+          # GitHub App for checkouts and status checks; the private key comes from Secrets Manager
+          # through the CasC secret source (AWS_SECRETS_MANAGER env in jenkins-values.yaml).
+          - gitHubApp:
+              id: github-app
+              appID: "${GITHUB_APP_ID}"
+              privateKey: "${GITHUB_APP_PRIVATE_KEY}"
+              description: shopfront GitHub App
+
+jobs:
+  - script: >
+      multibranchPipelineJob('shopfront') {
+        displayName('shopfront images')
+        branchSources {
+          github {
+            id('shopfront-github')
+            repoOwner('ErickrU')
+            repository('containers-on-aws')
+            credentialsId('github-app')
+            buildOriginBranch(true)
+            buildOriginPRMerge(true)
+            buildForkPRMerge(false)
+          }
+        }
+        factory {
+          workflowBranchProjectFactory { scriptPath('labs/pipelines/jenkins/Jenkinsfile') }
+        }
+        orphanedItemStrategy { discardOldItems { numToKeep(20) } }
+        triggers { periodicFolderTrigger { interval('1d') } }
+      }

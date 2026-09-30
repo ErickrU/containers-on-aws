@@ -1,0 +1,188 @@
+# Network policies for the shopfront namespace, enforced by the VPC CNI network policy agent (eBPF)
+# or by Cilium on standard clusters, and by the built-in agent on Auto Mode (hub/05 L300 §2.6).
+#
+# Model: deny everything, then allow the exact flows of labs/CONTRACT.md. Kubernetes policies are
+# additive allowlists, so a "quarantine" cannot be expressed as a deny; instead every allow policy
+# excludes pods carrying the label shopfront.example.com/quarantine, and an explicit quarantine
+# policy documents the resulting isolation. Isolate a suspicious pod with:
+#   kubectl -n shopfront label pod <pod> shopfront.example.com/quarantine=true
+#
+# Addresses: 10.42.0.0/16 is the VPC (ALB nodes, RDS Proxy, Valkey, VPC endpoints);
+# 169.254.169.254/32 is IMDS and is excluded from every egress rule as a second line of defence
+# behind the node hop limit of 1.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: shopfront
+  labels:
+    app.kubernetes.io/part-of: shopfront
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: shopfront
+  labels:
+    app.kubernetes.io/part-of: shopfront
+spec:
+  podSelector:
+    matchExpressions:
+      - { key: shopfront.example.com/quarantine, operator: DoesNotExist }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+---
+# Ingress from the ALB (any VPC address, since ALB nodes live in the public subnets) to the two HTTP
+# services, and from the observability namespace for Prometheus-style scraping of /metrics.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-http-services
+  namespace: shopfront
+  labels:
+    app.kubernetes.io/part-of: shopfront
+spec:
+  podSelector:
+    matchExpressions:
+      - { key: app.kubernetes.io/name, operator: In, values: [orders, catalog] }
+      - { key: shopfront.example.com/quarantine, operator: DoesNotExist }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - ipBlock:
+            cidr: 10.42.0.0/16
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+      ports:
+        - { protocol: TCP, port: 8080 }
+        - { protocol: TCP, port: 8081 }
+---
+# Workers expose /metrics and /healthz only; nothing outside monitoring needs to reach them.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-workers-metrics
+  namespace: shopfront
+  labels:
+    app.kubernetes.io/part-of: shopfront
+spec:
+  podSelector:
+    matchExpressions:
+      - { key: app.kubernetes.io/name, operator: In, values: [fulfillment-worker, analytics-consumer] }
+      - { key: shopfront.example.com/quarantine, operator: DoesNotExist }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+      ports:
+        - { protocol: TCP, port: 8082 }
+        - { protocol: TCP, port: 8083 }
+---
+# orders -> catalog is the only pod-to-pod call in the system.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-orders-to-catalog
+  namespace: shopfront
+  labels:
+    app.kubernetes.io/part-of: shopfront
+spec:
+  podSelector:
+    matchExpressions:
+      - { key: app.kubernetes.io/name, operator: In, values: [orders] }
+      - { key: shopfront.example.com/quarantine, operator: DoesNotExist }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: catalog
+      ports:
+        - { protocol: TCP, port: 8081 }
+---
+# Data plane inside the VPC: RDS Proxy (5432) and Valkey (6379). MSK (9098) for the two Kafka users.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-data-in-vpc
+  namespace: shopfront
+  labels:
+    app.kubernetes.io/part-of: shopfront
+spec:
+  podSelector:
+    matchExpressions:
+      - { key: shopfront.example.com/quarantine, operator: DoesNotExist }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 10.42.0.0/16
+      ports:
+        - { protocol: TCP, port: 5432 }
+        - { protocol: TCP, port: 6379 }
+        - { protocol: TCP, port: 9098 }
+---
+# AWS APIs (SQS, S3, STS, Secrets Manager via VPC endpoints or NAT) and the OTLP collector. HTTPS
+# anywhere except the IMDS address; the collector by namespace selector on 4318.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-aws-apis-and-otlp
+  namespace: shopfront
+  labels:
+    app.kubernetes.io/part-of: shopfront
+spec:
+  podSelector:
+    matchExpressions:
+      - { key: shopfront.example.com/quarantine, operator: DoesNotExist }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.169.254/32
+      ports:
+        - { protocol: TCP, port: 443 }
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: adot-collector
+      ports:
+        - { protocol: TCP, port: 4318 }
+        - { protocol: TCP, port: 4317 }
+---
+# Explicit quarantine: selects labelled pods and allows nothing. Combined with the DoesNotExist
+# exclusions above, a quarantined pod can neither receive nor send traffic (including DNS), while it
+# keeps running for forensics with `kubectl debug` (hub/06 L400 §2.6).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: quarantine
+  namespace: shopfront
+  labels:
+    app.kubernetes.io/part-of: shopfront
+spec:
+  podSelector:
+    matchLabels:
+      shopfront.example.com/quarantine: "true"
+  policyTypes: [Ingress, Egress]

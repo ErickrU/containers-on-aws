@@ -1,0 +1,58 @@
+{
+  "jobDefinitionName": "shopfront-dev-report-job",
+  "type": "container",
+  "platformCapabilities": ["FARGATE"],
+  "propagateTags": true,
+  "schedulingPriority": 10,
+  "retryStrategy": {
+    "attempts": 2,
+    "evaluateOnExit": [
+      { "action": "RETRY", "onStatusReason": "Host EC2*" },
+      { "action": "RETRY", "onReason": "CannotPullContainerError*" },
+      { "action": "RETRY", "onExitCode": "137" },
+      { "action": "EXIT", "onExitCode": "1" },
+      { "action": "RETRY", "onReason": "*" }
+    ]
+  },
+  "timeout": { "attemptDurationSeconds": 1800 },
+  "containerProperties": {
+    "image": "123456789012.dkr.ecr.us-east-1.amazonaws.com/shopfront/report-job@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "jobRoleArn": "arn:aws:iam::123456789012:role/shopfront-dev-report-job-task",
+    "executionRoleArn": "arn:aws:iam::123456789012:role/shopfront-dev-task-execution",
+    "fargatePlatformConfiguration": { "platformVersion": "LATEST" },
+    "runtimePlatform": { "cpuArchitecture": "ARM64", "operatingSystemFamily": "LINUX" },
+    "networkConfiguration": { "assignPublicIp": "DISABLED" },
+    "resourceRequirements": [
+      { "type": "VCPU", "value": "0.5" },
+      { "type": "MEMORY", "value": "1024" }
+    ],
+    "ephemeralStorage": { "sizeInGiB": 21 },
+    "environment": [
+      { "name": "AWS_REGION", "value": "us-east-1" },
+      { "name": "REPORT_OUTPUT", "value": "s3://shopfront-reports-dev-123456789012/daily/" },
+      { "name": "OTEL_SDK_DISABLED", "value": "true" },
+      { "name": "LOG_LEVEL", "value": "INFO" }
+    ],
+    "secrets": [
+      { "name": "DATABASE_URL", "valueFrom": "arn:aws:secretsmanager:us-east-1:123456789012:secret:shopfront/dev/database-url" }
+    ],
+    "user": "10001:10001",
+    "readonlyRootFilesystem": true,
+    "linuxParameters": { "initProcessEnabled": true },
+    "volumes": [{ "name": "tmp" }],
+    "mountPoints": [{ "sourceVolume": "tmp", "containerPath": "/tmp", "readOnly": false }],
+    "logConfiguration": {
+      "logDriver": "awslogs",
+      "options": {
+        "awslogs-group": "/shopfront/dev/report-job",
+        "awslogs-region": "us-east-1",
+        "awslogs-stream-prefix": "batch"
+      }
+    }
+  },
+  "tags": {
+    "Project": "shopfront",
+    "Environment": "dev",
+    "Service": "report-job"
+  }
+}

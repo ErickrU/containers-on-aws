@@ -1,0 +1,129 @@
+# orders: Node.js API behind the ALB. Every hardening field from hub/06 L300 §2.1 is here so you can
+# copy it; the same intent for ECS is labs/ecs/taskdefs/orders.json.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orders
+  namespace: shopfront
+  labels:
+    app.kubernetes.io/name: orders
+    app.kubernetes.io/part-of: shopfront
+    app.kubernetes.io/version: "0.1.0"
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  # Never drop below the current capacity during a rollout; surge one pod at a time. minReadySeconds
+  # makes a pod count as available only after 10 s Ready, so a crash-on-first-request is caught.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  minReadySeconds: 10
+  progressDeadlineSeconds: 600
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: orders
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: orders
+        app.kubernetes.io/part-of: shopfront
+        app.kubernetes.io/version: "0.1.0"
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /metrics
+    spec:
+      serviceAccountName: orders
+      automountServiceAccountToken: false
+      # 45 s > 20 s app drain + ALB deregistration (20 s) + preStop sleep. hub/10 L200 §2.4 has the timeline.
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: orders
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: orders
+      containers:
+        - name: orders
+          image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/shopfront/orders:sha-0000000
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: PORT
+              value: "8080"
+            - name: OTEL_SERVICE_NAME
+              value: orders
+            - name: NODE_OPTIONS
+              value: --max-old-space-size=384
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: shopfront-db
+                  key: DATABASE_URL
+          envFrom:
+            - configMapRef:
+                name: shopfront-config
+          # Requests drive scheduling and HPA percentages; the memory limit is the OOM boundary. No
+          # CPU limit on purpose: CFS throttling hurts p99 more than a noisy neighbour does (hub/01 L400 §2.6).
+          resources:
+            requests:
+              cpu: 250m
+              memory: 384Mi
+            limits:
+              memory: 512Mi
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2
+          lifecycle:
+            preStop:
+              # Keep serving while the endpoint removal propagates to kube-proxy and the ALB.
+              exec:
+                command: [sh, -c, sleep 5]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi

@@ -1,0 +1,57 @@
+# Helm values for Karpenter 1.14.1 on the EKS standard cluster (hub/04 L200 §2.7).
+#
+#   helm upgrade --install karpenter oci://public.ecr.aws/karpenter/karpenter --version 1.14.1 \
+#     -n kube-system -f labs/eks/addons/karpenter-values.yaml
+#   kubectl apply -f labs/eks/cluster/karpenter-nodepool.yaml
+#
+# The controller must never run on a node it manages (it would consolidate itself away): it is pinned
+# to the eksctl managed node group through the karpenter.sh/controller label set in eksctl-standard.yaml.
+# Credentials come from the Pod Identity association kube-system/karpenter created by eksctl.
+settings:
+  clusterName: shopfront-dev
+  # Interruption handling: Spot rebalance recommendations, Spot termination notices, AZ events and
+  # instance health events arrive on this SQS queue (create it with the Karpenter getting-started
+  # CloudFormation or leave empty to disable interruption handling).
+  interruptionQueue: shopfront-dev-karpenter-interruptions
+  featureGates:
+    spotToSpotConsolidation: true
+
+replicas: 2
+podDisruptionBudget:
+  maxUnavailable: 1
+
+serviceAccount:
+  create: true
+  name: karpenter
+  annotations: {}            # Pod Identity, not IRSA
+
+nodeSelector:
+  karpenter.sh/controller: "true"
+affinity:
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - topologyKey: kubernetes.io/hostname
+        labelSelector:
+          matchLabels:
+            app.kubernetes.io/name: karpenter
+tolerations:
+  - key: CriticalAddonsOnly
+    operator: Exists
+
+controller:
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      memory: 1Gi
+  env:
+    - name: AWS_REGION
+      value: us-east-1
+
+logLevel: info
+webhook:
+  enabled: false             # v1 API: conversion webhooks are no longer needed
+
+serviceMonitor:
+  enabled: false             # true when kube-prometheus-stack or the AMP collector scrapes ServiceMonitors

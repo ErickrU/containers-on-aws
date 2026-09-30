@@ -1,0 +1,6 @@
+# Keep the build context to what the image needs: requirements.txt and worker/.
+*
+!requirements.txt
+!worker/
+worker/**/__pycache__/
+worker/**/*.pyc

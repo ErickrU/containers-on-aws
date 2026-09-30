@@ -1,0 +1,537 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  shopfront network layer: VPC 10.42.0.0/16 with public, private, isolated and EKS control-plane
+  subnets across three AZs, NAT, security groups referencing each other, and the interface/gateway
+  endpoints a private container platform needs. Teaching lab (see hub/05-networking).
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: shopfront
+    AllowedPattern: '^[a-z][a-z0-9-]{1,20}$'
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  VpcCidr:
+    Type: String
+    Default: 10.42.0.0/16
+  SingleNatGateway:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'true = one NAT gateway (cheaper, dev). false = one per AZ (production).'
+  CreateEksControlPlaneSubnets:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Dedicated /28 subnets for EKS cluster ENIs (hub/04-eks, hub/05-networking L100).
+
+Conditions:
+  ThreeNats: !Not [!Equals [!Ref SingleNatGateway, 'true']]
+  EksSubnets: !Equals [!Ref CreateEksControlPlaneSubnets, 'true']
+
+Resources:
+  # ------------------------------------------------------------------ VPC and gateways ----------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}' }
+        - { Key: Project, Value: !Ref ProjectName }
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-${Environment}' }]
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # ------------------------------------------------------------------ public subnets /22 -------
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.0.0/22
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-public-a' }
+        - { Key: kubernetes.io/role/elb, Value: '1' }
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.4.0/22
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-public-b' }
+        - { Key: kubernetes.io/role/elb, Value: '1' }
+  PublicSubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.8.0/22
+      AvailabilityZone: !Select [2, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-public-c' }
+        - { Key: kubernetes.io/role/elb, Value: '1' }
+
+  # ------------------------------------------------------------------ private subnets /20 ------
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.16.0/20
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-private-a' }
+        - { Key: kubernetes.io/role/internal-elb, Value: '1' }
+        - { Key: karpenter.sh/discovery, Value: !Sub '${ProjectName}-${Environment}' }
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.32.0/20
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-private-b' }
+        - { Key: kubernetes.io/role/internal-elb, Value: '1' }
+        - { Key: karpenter.sh/discovery, Value: !Sub '${ProjectName}-${Environment}' }
+  PrivateSubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.48.0/20
+      AvailabilityZone: !Select [2, !GetAZs '']
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-private-c' }
+        - { Key: kubernetes.io/role/internal-elb, Value: '1' }
+        - { Key: karpenter.sh/discovery, Value: !Sub '${ProjectName}-${Environment}' }
+
+  # ------------------------------------------------------------------ isolated subnets /22 -----
+  IsolatedSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.64.0/22
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-${Environment}-isolated-a' }]
+  IsolatedSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.68.0/22
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-${Environment}-isolated-b' }]
+  IsolatedSubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.72.0/22
+      AvailabilityZone: !Select [2, !GetAZs '']
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-${Environment}-isolated-c' }]
+
+  # ------------------------------------------------------------------ EKS control-plane /28 ----
+  EksControlPlaneSubnetA:
+    Type: AWS::EC2::Subnet
+    Condition: EksSubnets
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.255.0/28
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-${Environment}-eks-cp-a' }]
+  EksControlPlaneSubnetB:
+    Type: AWS::EC2::Subnet
+    Condition: EksSubnets
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.255.16/28
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-${Environment}-eks-cp-b' }]
+  EksControlPlaneSubnetC:
+    Type: AWS::EC2::Subnet
+    Condition: EksSubnets
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.255.32/28
+      AvailabilityZone: !Select [2, !GetAZs '']
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-${Environment}-eks-cp-c' }]
+
+  # ------------------------------------------------------------------ NAT --------------------
+  NatEipA:
+    Type: AWS::EC2::EIP
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      Domain: vpc
+  NatGatewayA:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEipA.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-${Environment}-nat-a' }]
+  NatEipB:
+    Type: AWS::EC2::EIP
+    Condition: ThreeNats
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      Domain: vpc
+  NatGatewayB:
+    Type: AWS::EC2::NatGateway
+    Condition: ThreeNats
+    Properties:
+      AllocationId: !GetAtt NatEipB.AllocationId
+      SubnetId: !Ref PublicSubnetB
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-${Environment}-nat-b' }]
+  NatEipC:
+    Type: AWS::EC2::EIP
+    Condition: ThreeNats
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      Domain: vpc
+  NatGatewayC:
+    Type: AWS::EC2::NatGateway
+    Condition: ThreeNats
+    Properties:
+      AllocationId: !GetAtt NatEipC.AllocationId
+      SubnetId: !Ref PublicSubnetC
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-${Environment}-nat-c' }]
+
+  # ------------------------------------------------------------------ route tables ------------
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-${Environment}-public' }]
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicRtAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetA, RouteTableId: !Ref PublicRouteTable }
+  PublicRtAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetB, RouteTableId: !Ref PublicRouteTable }
+  PublicRtAssocC:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetC, RouteTableId: !Ref PublicRouteTable }
+
+  PrivateRouteTableA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-${Environment}-private-a' }]
+  PrivateRouteTableB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-${Environment}-private-b' }]
+  PrivateRouteTableC:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-${Environment}-private-c' }]
+  PrivateDefaultRouteA:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableA
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayA
+  PrivateDefaultRouteB:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableB
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !If [ThreeNats, !Ref NatGatewayB, !Ref NatGatewayA]
+  PrivateDefaultRouteC:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableC
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !If [ThreeNats, !Ref NatGatewayC, !Ref NatGatewayA]
+  PrivateRtAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnetA, RouteTableId: !Ref PrivateRouteTableA }
+  PrivateRtAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnetB, RouteTableId: !Ref PrivateRouteTableB }
+  PrivateRtAssocC:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnetC, RouteTableId: !Ref PrivateRouteTableC }
+
+  IsolatedRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-${Environment}-isolated' }]
+  IsolatedRtAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref IsolatedSubnetA, RouteTableId: !Ref IsolatedRouteTable }
+  IsolatedRtAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref IsolatedSubnetB, RouteTableId: !Ref IsolatedRouteTable }
+  IsolatedRtAssocC:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref IsolatedSubnetC, RouteTableId: !Ref IsolatedRouteTable }
+
+  EksCpRtAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: EksSubnets
+    Properties: { SubnetId: !Ref EksControlPlaneSubnetA, RouteTableId: !Ref IsolatedRouteTable }
+  EksCpRtAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: EksSubnets
+    Properties: { SubnetId: !Ref EksControlPlaneSubnetB, RouteTableId: !Ref IsolatedRouteTable }
+  EksCpRtAssocC:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: EksSubnets
+    Properties: { SubnetId: !Ref EksControlPlaneSubnetC, RouteTableId: !Ref IsolatedRouteTable }
+
+  # ------------------------------------------------------------------ security groups ---------
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Internet-facing ALB
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: HTTPS from the internet }
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0, Description: HTTP redirect to HTTPS }
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-${Environment}-alb' }]
+
+  ServicesSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS tasks and EKS pods of the shopfront services
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-services' }
+        - { Key: karpenter.sh/discovery, Value: !Sub '${ProjectName}-${Environment}' }
+  ServicesIngressFromAlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ServicesSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8083
+      SourceSecurityGroupId: !Ref AlbSecurityGroup
+      Description: ALB to service ports
+  ServicesIngressFromServices:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ServicesSecurityGroup
+      IpProtocol: tcp
+      FromPort: 0
+      ToPort: 65535
+      SourceSecurityGroupId: !Ref ServicesSecurityGroup
+      Description: service to service (Service Connect agents, HTTP between services)
+
+  DataSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Aurora, ElastiCache and MSK; only the services may connect
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 5432, ToPort: 5432, SourceSecurityGroupId: !Ref ServicesSecurityGroup, Description: PostgreSQL }
+        - { IpProtocol: tcp, FromPort: 6379, ToPort: 6379, SourceSecurityGroupId: !Ref ServicesSecurityGroup, Description: Valkey }
+        - { IpProtocol: tcp, FromPort: 9098, ToPort: 9098, SourceSecurityGroupId: !Ref ServicesSecurityGroup, Description: MSK IAM }
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-${Environment}-data' }]
+  DataIngressFromSelf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DataSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref DataSecurityGroup
+      Description: RDS Proxy to Aurora
+
+  EndpointsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Interface endpoints; HTTPS from the VPC
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: !Ref VpcCidr, Description: HTTPS from the VPC }
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-${Environment}-endpoints' }]
+
+  IsolationSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Incident isolation - no ingress, no egress (hub/06 L400)
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - { IpProtocol: '-1', CidrIp: 127.0.0.1/32, Description: no egress }
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-${Environment}-isolation' }]
+
+  # ------------------------------------------------------------------ endpoints ---------------
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref PrivateRouteTableA, !Ref PrivateRouteTableB, !Ref PrivateRouteTableC, !Ref IsolatedRouteTable]
+
+  EcrApiEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.api'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB, !Ref PrivateSubnetC]
+      SecurityGroupIds: [!Ref EndpointsSecurityGroup]
+  EcrDkrEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.dkr'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB, !Ref PrivateSubnetC]
+      SecurityGroupIds: [!Ref EndpointsSecurityGroup]
+  LogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.logs'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB, !Ref PrivateSubnetC]
+      SecurityGroupIds: [!Ref EndpointsSecurityGroup]
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.secretsmanager'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB, !Ref PrivateSubnetC]
+      SecurityGroupIds: [!Ref EndpointsSecurityGroup]
+  StsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.sts'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB, !Ref PrivateSubnetC]
+      SecurityGroupIds: [!Ref EndpointsSecurityGroup]
+  SqsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.sqs'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB, !Ref PrivateSubnetC]
+      SecurityGroupIds: [!Ref EndpointsSecurityGroup]
+  SsmMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB, !Ref PrivateSubnetC]
+      SecurityGroupIds: [!Ref EndpointsSecurityGroup]
+  MonitoringEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.monitoring'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB, !Ref PrivateSubnetC]
+      SecurityGroupIds: [!Ref EndpointsSecurityGroup]
+  XrayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.xray'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB, !Ref PrivateSubnetC]
+      SecurityGroupIds: [!Ref EndpointsSecurityGroup]
+
+  # ------------------------------------------------------------------ flow logs ---------------
+  FlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/${ProjectName}/${Environment}/vpc-flow-logs'
+      RetentionInDays: 30
+  FlowLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: vpc-flow-logs.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { 'aws:SourceAccount': !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: write-flow-logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents, logs:DescribeLogStreams]
+                Resource: !GetAtt FlowLogGroup.Arn
+  VpcFlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceId: !Ref Vpc
+      ResourceType: VPC
+      TrafficType: REJECT
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref FlowLogGroup
+      DeliverLogsPermissionArn: !GetAtt FlowLogRole.Arn
+      MaxAggregationInterval: 60
+
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+    Export: { Name: !Sub '${ProjectName}-${Environment}-VpcId' }
+  VpcCidr:
+    Value: !Ref VpcCidr
+    Export: { Name: !Sub '${ProjectName}-${Environment}-VpcCidr' }
+  PublicSubnetIds:
+    Value: !Join [',', [!Ref PublicSubnetA, !Ref PublicSubnetB, !Ref PublicSubnetC]]
+    Export: { Name: !Sub '${ProjectName}-${Environment}-PublicSubnetIds' }
+  PrivateSubnetIds:
+    Value: !Join [',', [!Ref PrivateSubnetA, !Ref PrivateSubnetB, !Ref PrivateSubnetC]]
+    Export: { Name: !Sub '${ProjectName}-${Environment}-PrivateSubnetIds' }
+  IsolatedSubnetIds:
+    Value: !Join [',', [!Ref IsolatedSubnetA, !Ref IsolatedSubnetB, !Ref IsolatedSubnetC]]
+    Export: { Name: !Sub '${ProjectName}-${Environment}-IsolatedSubnetIds' }
+  EksControlPlaneSubnetIds:
+    Condition: EksSubnets
+    Value: !Join [',', [!Ref EksControlPlaneSubnetA, !Ref EksControlPlaneSubnetB, !Ref EksControlPlaneSubnetC]]
+    Export: { Name: !Sub '${ProjectName}-${Environment}-EksControlPlaneSubnetIds' }
+  AlbSecurityGroupId:
+    Value: !Ref AlbSecurityGroup
+    Export: { Name: !Sub '${ProjectName}-${Environment}-AlbSecurityGroupId' }
+  ServicesSecurityGroupId:
+    Value: !Ref ServicesSecurityGroup
+    Export: { Name: !Sub '${ProjectName}-${Environment}-ServicesSecurityGroupId' }
+  DataSecurityGroupId:
+    Value: !Ref DataSecurityGroup
+    Export: { Name: !Sub '${ProjectName}-${Environment}-DataSecurityGroupId' }
+  IsolationSecurityGroupId:
+    Value: !Ref IsolationSecurityGroup
+    Export: { Name: !Sub '${ProjectName}-${Environment}-IsolationSecurityGroupId' }

@@ -1,0 +1,280 @@
+# ADOT collector as a gateway Deployment in the observability namespace (hub/07 L200 §2.3, L400 §2.1).
+#
+#   kubectl apply -f labs/eks/addons/adot-collector.yaml
+#   kubectl -n observability get deploy,svc adot-collector
+#
+# Pipeline: the shopfront pods send OTLP to adot-collector.observability:4318 (HTTP) or :4317 (gRPC).
+#   traces  -> memory_limiter -> resourcedetection(eks) -> tail_sampling -> batch -> awsxray
+#   metrics -> memory_limiter -> resourcedetection(eks) -> batch -> awsemf (CloudWatch EMF) [+ prometheusremotewrite to AMP]
+#   logs    are not routed through this collector: the CloudWatch Observability add-on ships stdout with Fluent Bit.
+# Credentials: Pod Identity association for observability/adot-collector with xray:PutTraceSegments,
+# xray:PutTelemetryRecords, cloudwatch:PutMetricData, logs:PutLogEvents/CreateLogStream/CreateLogGroup
+# (and aps:RemoteWrite when the AMP exporter is enabled). addons/pod-identity-associations.sh creates it.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: observability
+  labels:
+    app.kubernetes.io/part-of: platform
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: adot-collector
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: adot-collector
+    app.kubernetes.io/part-of: platform
+automountServiceAccountToken: true   # the k8sattributes processor reads pod metadata from the API
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: adot-collector
+rules:
+  - apiGroups: [""]
+    resources: [pods, namespaces, nodes]
+    verbs: [get, list, watch]
+  - apiGroups: [apps]
+    resources: [replicasets, deployments]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: adot-collector
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: adot-collector
+subjects:
+  - kind: ServiceAccount
+    name: adot-collector
+    namespace: observability
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: adot-collector-config
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: adot-collector
+    app.kubernetes.io/part-of: platform
+data:
+  collector.yaml: |
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+      pprof:
+        endpoint: 127.0.0.1:1777
+
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+
+    processors:
+      # First in every pipeline: refuse data instead of being OOM-killed. Limit below the container limit.
+      memory_limiter:
+        check_interval: 1s
+        limit_mib: 700
+        spike_limit_mib: 150
+      # Adds cloud.provider, cloud.region, k8s.cluster.name from IMDS-free sources (EKS detector uses the API).
+      resourcedetection:
+        detectors: [env, eks]
+        timeout: 5s
+        override: false
+      # Pod/namespace/deployment attributes from the API server, keyed by the pod IP of the sender.
+      k8sattributes:
+        auth_type: serviceAccount
+        passthrough: false
+        extract:
+          metadata: [k8s.namespace.name, k8s.pod.name, k8s.deployment.name, k8s.node.name]
+        pod_association:
+          - sources:
+              - from: connection
+      # Keep every error and slow trace, 10% of the rest. Decisions need the whole trace, hence the
+      # gateway (not per-node) deployment and the decision wait.
+      tail_sampling:
+        decision_wait: 10s
+        num_traces: 50000
+        expected_new_traces_per_sec: 500
+        policies:
+          - name: errors
+            type: status_code
+            status_code: { status_codes: [ERROR] }
+          - name: slow
+            type: latency
+            latency: { threshold_ms: 1000 }
+          - name: baseline
+            type: probabilistic
+            probabilistic: { sampling_percentage: 10 }
+      batch:
+        send_batch_size: 512
+        send_batch_max_size: 1024
+        timeout: 5s
+
+    exporters:
+      awsxray:
+        region: us-east-1
+        index_all_attributes: false
+        indexed_attributes: [http.route, deployment.environment]
+      awsemf:
+        region: us-east-1
+        namespace: shopfront/otel
+        log_group_name: /shopfront/otel-metrics
+        dimension_rollup_option: NoDimensionRollup
+        resource_to_telemetry_conversion:
+          enabled: true
+      # prometheusremotewrite:
+      #   endpoint: https://aps-workspaces.us-east-1.amazonaws.com/workspaces/ws-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/api/v1/remote_write
+      #   auth:
+      #     authenticator: sigv4auth
+      debug:
+        verbosity: basic
+        sampling_initial: 2
+        sampling_thereafter: 500
+
+    service:
+      extensions: [health_check, pprof]
+      telemetry:
+        metrics:
+          level: detailed
+          readers:
+            - pull:
+                exporter:
+                  prometheus:
+                    host: 0.0.0.0
+                    port: 8888
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, resourcedetection, k8sattributes, tail_sampling, batch]
+          exporters: [awsxray]
+        metrics:
+          receivers: [otlp]
+          processors: [memory_limiter, resourcedetection, k8sattributes, batch]
+          exporters: [awsemf]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: adot-collector
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: adot-collector
+    app.kubernetes.io/part-of: platform
+    app.kubernetes.io/version: v0.50.0
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: adot-collector
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: adot-collector
+        app.kubernetes.io/part-of: platform
+        app.kubernetes.io/version: v0.50.0
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8888"
+    spec:
+      serviceAccountName: adot-collector
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: adot-collector
+      containers:
+        - name: collector
+          image: public.ecr.aws/aws-observability/aws-otel-collector:v0.50.0
+          args: [--config=/conf/collector.yaml]
+          ports:
+            - { name: otlp-grpc, containerPort: 4317, protocol: TCP }
+            - { name: otlp-http, containerPort: 4318, protocol: TCP }
+            - { name: metrics, containerPort: 8888, protocol: TCP }
+            - { name: health, containerPort: 13133, protocol: TCP }
+          env:
+            - name: AWS_REGION
+              value: us-east-1
+            - name: K8S_CLUSTER_NAME
+              value: shopfront-dev
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: k8s.cluster.name=shopfront-dev
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              memory: 1Gi         # memory_limiter is set to 700 MiB, leaving headroom for the runtime
+          livenessProbe:
+            httpGet:
+              path: /
+              port: health
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /
+              port: health
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: config
+              mountPath: /conf
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: adot-collector-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: adot-collector
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: adot-collector
+    app.kubernetes.io/part-of: platform
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: adot-collector
+  ports:
+    - { name: otlp-grpc, port: 4317, targetPort: otlp-grpc, protocol: TCP }
+    - { name: otlp-http, port: 4318, targetPort: otlp-http, protocol: TCP }
+    - { name: metrics, port: 8888, targetPort: metrics, protocol: TCP }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: adot-collector
+  namespace: observability
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: adot-collector

@@ -1,0 +1,321 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  shopfront data layer: Aurora PostgreSQL Serverless v2 (managed admin credentials, IAM auth) behind
+  RDS Proxy, ElastiCache Serverless for Valkey, SQS queue + dead-letter queue, optional MSK Serverless,
+  reports bucket, and the DATABASE_URL secret the services read (populated by deploy.sh). Optional
+  Aurora Global Database and cross-Region secret replicas for the DR labs (hub/09, hub/10).
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: shopfront
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  DbEngineVersion:
+    Type: String
+    Default: '16.4'
+    Description: Aurora PostgreSQL engine version (verify availability in the Region).
+  DbMinCapacity:
+    Type: Number
+    Default: 0.5
+  DbMaxCapacity:
+    Type: Number
+    Default: 4
+  EnableKafka:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: MSK Serverless costs by the hour; off by default for the lab.
+  ReplicationRegion:
+    Type: String
+    Default: ''
+    Description: Optional DR Region. Enables an Aurora Global Database and secret replicas.
+  DeletionProtection:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+
+Conditions:
+  Kafka: !Equals [!Ref EnableKafka, 'true']
+  Replicate: !Not [!Equals [!Ref ReplicationRegion, '']]
+  IsProd: !Equals [!Ref Environment, prod]
+  Protect: !Equals [!Ref DeletionProtection, 'true']
+
+Resources:
+  # ------------------------------------------------------------------ Aurora ------------------
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: isolated subnets for shopfront data
+      SubnetIds: !Split
+        - ','
+        - !ImportValue
+          Fn::Sub: '${ProjectName}-${Environment}-IsolatedSubnetIds'
+
+  DbClusterParameterGroup:
+    Type: AWS::RDS::DBClusterParameterGroup
+    Properties:
+      Description: force TLS, log slow statements
+      Family: aurora-postgresql16
+      Parameters:
+        rds.force_ssl: '1'
+        log_min_duration_statement: '1000'
+
+  DbCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBClusterIdentifier: !Sub '${ProjectName}-${Environment}'
+      Engine: aurora-postgresql
+      EngineVersion: !Ref DbEngineVersion
+      EngineMode: provisioned
+      DatabaseName: shopfront
+      MasterUsername: app
+      ManageMasterUserPassword: true
+      EnableIAMDatabaseAuthentication: true
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      DBClusterParameterGroupName: !Ref DbClusterParameterGroup
+      VpcSecurityGroupIds:
+        - !ImportValue
+          Fn::Sub: '${ProjectName}-${Environment}-DataSecurityGroupId'
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: !Ref DbMinCapacity
+        MaxCapacity: !Ref DbMaxCapacity
+      StorageEncrypted: true
+      BackupRetentionPeriod: !If [IsProd, 14, 3]
+      PreferredBackupWindow: '03:00-04:00'
+      DeletionProtection: !If [Protect, true, false]
+      EnableCloudwatchLogsExports: [postgresql]
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  DbWriter:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref DbCluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-postgresql
+      PubliclyAccessible: false
+      AutoMinorVersionUpgrade: true
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7
+
+  DbReader:
+    Type: AWS::RDS::DBInstance
+    Condition: IsProd
+    Properties:
+      DBClusterIdentifier: !Ref DbCluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-postgresql
+      PubliclyAccessible: false
+      PromotionTier: 1
+
+  # Aurora Global Database wraps the primary cluster; the secondary cluster is created in the DR
+  # Region by the DR variant of this stack (parameters/<env>-<region>.json) referencing the global id.
+  GlobalCluster:
+    Type: AWS::RDS::GlobalCluster
+    Condition: Replicate
+    Properties:
+      GlobalClusterIdentifier: !Sub '${ProjectName}-${Environment}-global'
+      SourceDBClusterIdentifier: !Ref DbCluster
+
+  # ------------------------------------------------------------------ RDS Proxy ---------------
+  ProxyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: rds.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: read-db-secret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [secretsmanager:GetSecretValue]
+                Resource: !GetAtt DbCluster.MasterUserSecret.SecretArn
+              - Effect: Allow
+                Action: [kms:Decrypt]
+                Resource: !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+                Condition:
+                  StringEquals: { 'kms:ViaService': !Sub 'secretsmanager.${AWS::Region}.amazonaws.com' }
+
+  DbProxy:
+    Type: AWS::RDS::DBProxy
+    Properties:
+      DBProxyName: !Sub '${ProjectName}-${Environment}'
+      EngineFamily: POSTGRESQL
+      RequireTLS: true
+      IdleClientTimeout: 1800
+      RoleArn: !GetAtt ProxyRole.Arn
+      Auth:
+        - AuthScheme: SECRETS
+          SecretArn: !GetAtt DbCluster.MasterUserSecret.SecretArn
+          IAMAuth: DISABLED
+          ClientPasswordAuthType: POSTGRES_SCRAM_SHA_256
+      VpcSubnetIds: !Split
+        - ','
+        - !ImportValue
+          Fn::Sub: '${ProjectName}-${Environment}-IsolatedSubnetIds'
+      VpcSecurityGroupIds:
+        - !ImportValue
+          Fn::Sub: '${ProjectName}-${Environment}-DataSecurityGroupId'
+
+  DbProxyTargetGroup:
+    Type: AWS::RDS::DBProxyTargetGroup
+    DependsOn: DbWriter
+    Properties:
+      DBProxyName: !Ref DbProxy
+      TargetGroupName: default
+      DBClusterIdentifiers: [!Ref DbCluster]
+      ConnectionPoolConfigurationInfo:
+        MaxConnectionsPercent: 90
+        MaxIdleConnectionsPercent: 10
+        ConnectionBorrowTimeout: 30
+
+  # DATABASE_URL as the services expect it (labs/CONTRACT.md). CloudFormation cannot compose the URL
+  # from the managed password without a custom resource, so deploy.sh writes the value after this
+  # stack completes: postgres://app:<password>@<proxy endpoint>:5432/shopfront?sslmode=require
+  DatabaseUrlSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectName}/${Environment}/database-url'
+      Description: Composed by deploy.sh from the managed admin secret and the RDS Proxy endpoint
+      SecretString: 'pending:deploy.sh writes this value'
+      ReplicaRegions: !If
+        - Replicate
+        - [{ Region: !Ref ReplicationRegion }]
+        - !Ref AWS::NoValue
+
+  # ------------------------------------------------------------------ Valkey ------------------
+  ValkeyCache:
+    Type: AWS::ElastiCache::ServerlessCache
+    Properties:
+      ServerlessCacheName: !Sub '${ProjectName}-${Environment}'
+      Engine: valkey
+      MajorEngineVersion: '8'
+      Description: product cache (cache-aside, TTL 60 s)
+      SecurityGroupIds:
+        - !ImportValue
+          Fn::Sub: '${ProjectName}-${Environment}-DataSecurityGroupId'
+      SubnetIds: !Split
+        - ','
+        - !ImportValue
+          Fn::Sub: '${ProjectName}-${Environment}-IsolatedSubnetIds'
+      CacheUsageLimits:
+        DataStorage: { Maximum: 5, Unit: GB }
+        ECPUPerSecond: { Maximum: 5000 }
+
+  # ------------------------------------------------------------------ SQS ---------------------
+  OrdersDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-${Environment}-orders-created-dlq'
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  OrdersQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-${Environment}-orders-created'
+      VisibilityTimeout: 30
+      ReceiveMessageWaitTimeSeconds: 20
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrdersDeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  # ------------------------------------------------------------------ MSK (optional) ----------
+  KafkaCluster:
+    Type: AWS::MSK::ServerlessCluster
+    Condition: Kafka
+    Properties:
+      ClusterName: !Sub '${ProjectName}-${Environment}'
+      ClientAuthentication:
+        Sasl:
+          Iam: { Enabled: true }
+      VpcConfigs:
+        - SubnetIds: !Split
+            - ','
+            - !ImportValue
+              Fn::Sub: '${ProjectName}-${Environment}-IsolatedSubnetIds'
+          SecurityGroups:
+            - !ImportValue
+              Fn::Sub: '${ProjectName}-${Environment}-DataSecurityGroupId'
+
+  # ------------------------------------------------------------------ S3 ----------------------
+  ReportsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-reports-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration: { Status: Enabled }
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-reports
+            Status: Enabled
+            ExpirationInDays: 365
+            NoncurrentVersionExpiration: { NoncurrentDays: 30 }
+
+  ReportsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ReportsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource: [!GetAtt ReportsBucket.Arn, !Sub '${ReportsBucket.Arn}/*']
+            Condition:
+              Bool: { 'aws:SecureTransport': 'false' }
+
+Outputs:
+  DbClusterEndpoint:
+    Value: !GetAtt DbCluster.Endpoint.Address
+    Export: { Name: !Sub '${ProjectName}-${Environment}-DbClusterEndpoint' }
+  DbProxyEndpoint:
+    Value: !GetAtt DbProxy.Endpoint
+    Export: { Name: !Sub '${ProjectName}-${Environment}-DbProxyEndpoint' }
+  DbAdminSecretArn:
+    Value: !GetAtt DbCluster.MasterUserSecret.SecretArn
+    Export: { Name: !Sub '${ProjectName}-${Environment}-DbAdminSecretArn' }
+  DatabaseUrlSecretArn:
+    Value: !Ref DatabaseUrlSecret
+    Export: { Name: !Sub '${ProjectName}-${Environment}-DatabaseUrlSecretArn' }
+  ValkeyEndpoint:
+    Value: !GetAtt ValkeyCache.Endpoint.Address
+    Export: { Name: !Sub '${ProjectName}-${Environment}-ValkeyEndpoint' }
+  OrdersQueueUrl:
+    Value: !Ref OrdersQueue
+    Export: { Name: !Sub '${ProjectName}-${Environment}-OrdersQueueUrl' }
+  OrdersQueueName:
+    Value: !GetAtt OrdersQueue.QueueName
+    Export: { Name: !Sub '${ProjectName}-${Environment}-OrdersQueueName' }
+  OrdersDlqName:
+    Value: !GetAtt OrdersDeadLetterQueue.QueueName
+    Export: { Name: !Sub '${ProjectName}-${Environment}-OrdersDlqName' }
+  KafkaClusterArn:
+    Condition: Kafka
+    Value: !Ref KafkaCluster
+    Export: { Name: !Sub '${ProjectName}-${Environment}-KafkaClusterArn' }
+  ReportsBucketName:
+    Value: !Ref ReportsBucket
+    Export: { Name: !Sub '${ProjectName}-${Environment}-ReportsBucketName' }

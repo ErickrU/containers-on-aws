@@ -1,0 +1,53 @@
+# Non-secret configuration shared by the shopfront pods (labs/CONTRACT.md §3). Overlays patch the
+# environment-specific values (queue URL, Valkey endpoint, Kafka brokers).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: shopfront-config
+  namespace: shopfront
+  labels:
+    app.kubernetes.io/part-of: shopfront
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+data:
+  AWS_REGION: us-east-1
+  CATALOG_URL: http://catalog.shopfront.svc.cluster.local:8081
+  SQS_QUEUE_URL: https://sqs.us-east-1.amazonaws.com/123456789012/shopfront-dev-orders-created
+  SQS_WAIT_TIME_SECONDS: "20"
+  SQS_MAX_MESSAGES: "10"
+  VALKEY_URL: rediss://shopfront-dev-xxxxxx.serverless.use1.cache.amazonaws.com:6379
+  CACHE_TTL_SECONDS: "60"
+  KAFKA_BROKERS: ""
+  KAFKA_TOPIC: orders.created
+  KAFKA_GROUP_ID: analytics
+  KAFKA_SASL_IAM: "false"
+  # ADOT collector Deployment + Service in the observability namespace (addons/adot-collector.yaml).
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://adot-collector.observability.svc.cluster.local:4318
+  OTEL_RESOURCE_ATTRIBUTES: deployment.environment=dev
+  SHUTDOWN_TIMEOUT_SECONDS: "20"
+  REPORT_OUTPUT: s3://shopfront-reports-dev-123456789012/daily/
+---
+# DATABASE_URL is synced from AWS Secrets Manager by External Secrets Operator into a Kubernetes
+# Secret named shopfront-db. The ClusterSecretStore lives in addons/external-secrets-clustersecretstore.yaml.
+# hub/06 L200 §2.6 compares this with the Secrets Store CSI driver and with ECS `secrets[]`.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: shopfront-db
+  namespace: shopfront
+  labels:
+    app.kubernetes.io/part-of: shopfront
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: aws-secrets-manager
+  target:
+    name: shopfront-db
+    creationPolicy: Owner
+  data:
+    - secretKey: DATABASE_URL
+      remoteRef:
+        key: shopfront/dev/database-url

@@ -1,0 +1,240 @@
+// Declarative pipeline for the shopfront images on Jenkins running in EKS with ephemeral Kubernetes
+// agents (hub/08 L200 §2.3, L300 §2.5). Each stage runs in a container of a pod template that lives
+// only for this build: no state on the controller, no docker socket, no long-lived credentials.
+//
+// Image builds use BuildKit in rootless mode inside the agent pod (moby/buildkit:rootless); kaniko is
+// the alternative when the cluster forbids user namespaces. AWS credentials come from the Pod Identity
+// association of the `jenkins-agent` ServiceAccount (jcasc.yaml), so `aws ecr get-login-password`
+// works with no secret in Jenkins.
+pipeline {
+  agent {
+    kubernetes {
+      serviceAccount 'jenkins-agent'
+      defaultContainer 'tools'
+      yaml '''
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    app.kubernetes.io/part-of: shopfront-ci
+spec:
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 1000
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: tools
+      image: public.ecr.aws/aws-cli/aws-cli:2.37.6
+      command: [sleep]
+      args: [infinity]
+      resources:
+        requests: { cpu: 100m, memory: 128Mi }
+        limits: { memory: 512Mi }
+      securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+    - name: go
+      image: public.ecr.aws/docker/library/golang:1.23-bookworm
+      command: [sleep]
+      args: [infinity]
+      env: [{ name: GOCACHE, value: /tmp/gocache }, { name: GOMODCACHE, value: /tmp/gomod }]
+      resources:
+        requests: { cpu: 500m, memory: 1Gi }
+        limits: { memory: 2Gi }
+      securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+    - name: node
+      image: public.ecr.aws/docker/library/node:22-bookworm-slim
+      command: [sleep]
+      args: [infinity]
+      env: [{ name: npm_config_cache, value: /tmp/npm }]
+      resources:
+        requests: { cpu: 500m, memory: 1Gi }
+        limits: { memory: 2Gi }
+      securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+    - name: python
+      image: public.ecr.aws/docker/library/python:3.12-slim-bookworm
+      command: [sleep]
+      args: [infinity]
+      env: [{ name: PIP_CACHE_DIR, value: /tmp/pip }]
+      resources:
+        requests: { cpu: 250m, memory: 512Mi }
+        limits: { memory: 1Gi }
+      securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+    - name: buildkit
+      image: moby/buildkit:v0.33.0-rootless
+      args: [--oci-worker-no-process-sandbox]
+      env: [{ name: BUILDKITD_FLAGS, value: --oci-worker-no-process-sandbox }]
+      readinessProbe:
+        exec: { command: [buildctl, debug, workers] }
+        initialDelaySeconds: 5
+        periodSeconds: 10
+      resources:
+        requests: { cpu: "1", memory: 2Gi }
+        limits: { memory: 4Gi }
+      securityContext:
+        # Rootless BuildKit needs an unconfined seccomp/AppArmor profile for user namespaces; it still
+        # runs as uid 1000 with no host mounts. See hub/08 L200 §2.4 for the kaniko alternative.
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile: { type: Unconfined }
+        allowPrivilegeEscalation: false
+      volumeMounts:
+        - { name: buildkit-cache, mountPath: /home/user/.local/share/buildkit }
+    - name: trivy
+      image: public.ecr.aws/aquasecurity/trivy:0.74.0
+      command: [sleep]
+      args: [infinity]
+      resources:
+        requests: { cpu: 250m, memory: 512Mi }
+        limits: { memory: 2Gi }
+      securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+  volumes:
+    - name: buildkit-cache
+      emptyDir: { sizeLimit: 20Gi }
+  nodeSelector:
+    workload: general
+  tolerations: []
+'''
+    }
+  }
+
+  options {
+    timeout(time: 45, unit: 'MINUTES')
+    disableConcurrentBuilds(abortPrevious: true)
+    buildDiscarder(logRotator(numToKeepStr: '30'))
+    timestamps()
+    ansiColor('xterm')
+  }
+
+  environment {
+    AWS_REGION   = 'us-east-1'
+    ACCOUNT_ID   = '123456789012'
+    REGISTRY     = "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+    IMAGE_PREFIX = 'shopfront'
+    IMAGE_TAG    = "sha-${GIT_COMMIT.take(7)}"
+    PLATFORMS    = 'linux/amd64,linux/arm64'
+    SERVICES     = 'orders catalog worker report-job'
+  }
+
+  stages {
+    stage('Unit tests') {
+      parallel {
+        stage('catalog (Go)') {
+          steps {
+            container('go') {
+              dir('labs/apps/catalog') { sh 'go vet ./... && go test -race -count=1 ./...' }
+            }
+          }
+        }
+        stage('orders (Node)') {
+          steps {
+            container('node') {
+              dir('labs/apps/orders') { sh 'npm ci && npm test' }
+            }
+          }
+        }
+        stage('worker + report-job (Python)') {
+          steps {
+            container('python') {
+              sh '''
+                python -m pip install --quiet -r labs/apps/worker/requirements.txt -r labs/apps/report-job/requirements.txt pytest
+                python -m pytest -q labs/apps/worker labs/apps/report-job
+              '''
+            }
+          }
+        }
+      }
+    }
+
+    stage('ECR login') {
+      steps {
+        container('tools') {
+          // Pod Identity credentials -> 12-hour registry token, written where buildctl reads it.
+          sh '''
+            mkdir -p /tmp/.docker
+            token="$(aws ecr get-login-password --region "$AWS_REGION")"
+            auth="$(printf 'AWS:%s' "$token" | base64 -w0)"
+            printf '{"auths":{"%s":{"auth":"%s"}}}' "$REGISTRY" "$auth" > /tmp/.docker/config.json
+          '''
+        }
+      }
+    }
+
+    stage('Build, SBOM, provenance, push') {
+      steps {
+        container('buildkit') {
+          sh '''
+            export DOCKER_CONFIG=/tmp/.docker
+            for svc in $SERVICES; do
+              image="$REGISTRY/$IMAGE_PREFIX/$svc"
+              buildctl build \
+                --frontend dockerfile.v0 \
+                --local context="labs/apps/$svc" --local dockerfile="labs/apps/$svc" \
+                --opt platform="$PLATFORMS" \
+                --opt build-arg:VERSION="$IMAGE_TAG" --opt build-arg:REVISION="$GIT_COMMIT" \
+                --opt attest:sbom= --opt attest:provenance=mode=max \
+                --export-cache type=registry,ref="$image:buildcache",mode=max,image-manifest=true,oci-mediatypes=true \
+                --import-cache type=registry,ref="$image:buildcache" \
+                --output type=image,\\"name=$image:$IMAGE_TAG,$image:latest\\",push=true,oci-mediatypes=true \
+                --metadata-file "/tmp/$svc.json"
+            done
+          '''
+        }
+      }
+    }
+
+    stage('Scan pushed images') {
+      steps {
+        container('trivy') {
+          sh '''
+            export DOCKER_CONFIG=/tmp/.docker
+            for svc in $SERVICES; do
+              digest="$(sed -n 's/.*"containerimage.digest": *"\\([^"]*\\)".*/\\1/p' "/tmp/$svc.json")"
+              trivy image --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 \
+                --format table "$REGISTRY/$IMAGE_PREFIX/$svc@$digest"
+            done
+          '''
+        }
+      }
+    }
+
+    stage('Record digests') {
+      steps {
+        container('tools') {
+          sh '''
+            for svc in $SERVICES; do
+              digest="$(sed -n 's/.*"containerimage.digest": *"\\([^"]*\\)".*/\\1/p' "/tmp/$svc.json")"
+              echo "$svc $REGISTRY/$IMAGE_PREFIX/$svc@$digest" | tee -a digests.txt
+            done
+          '''
+          archiveArtifacts artifacts: 'digests.txt', fingerprint: true
+        }
+      }
+    }
+
+    stage('Deploy to ECS dev') {
+      when { branch 'main' }
+      steps {
+        container('tools') {
+          sh '''
+            aws cloudformation deploy \
+              --stack-name shopfront-dev-04-services \
+              --template-file labs/ecs/cloudformation/04-services.yaml \
+              --parameter-overrides ProjectName=shopfront Environment=dev ImageTag="$IMAGE_TAG" \
+              --capabilities CAPABILITY_NAMED_IAM --no-fail-on-empty-changeset
+            aws ecs wait services-stable --cluster shopfront-dev --services orders catalog fulfillment-worker
+          '''
+        }
+      }
+    }
+  }
+
+  post {
+    failure {
+      echo "Build failed: ${env.BUILD_URL}"   // wire to Slack/SNS with the notification plugin of your choice
+    }
+    always {
+      cleanWs()
+    }
+  }
+}

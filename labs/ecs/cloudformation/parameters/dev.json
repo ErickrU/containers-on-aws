@@ -1,0 +1,49 @@
+{
+  "_comment": "Parameter overrides per stack for the dev environment. deploy.sh renders each block as Key=Value pairs. Values are strings because CloudFormation parameters are strings.",
+  "project": "shopfront",
+  "environment": "dev",
+  "region": "us-east-1",
+  "stacks": {
+    "01-network": {
+      "VpcCidr": "10.42.0.0/16",
+      "SingleNatGateway": "true",
+      "CreateEksControlPlaneSubnets": "true"
+    },
+    "02-cluster": {
+      "ReplicationRegion": "",
+      "LogRetentionDays": "30"
+    },
+    "03-data": {
+      "DbEngineVersion": "16.4",
+      "DbMinCapacity": "0.5",
+      "DbMaxCapacity": "4",
+      "EnableKafka": "false",
+      "ReplicationRegion": "",
+      "DeletionProtection": "false"
+    },
+    "04-services": {
+      "ImageTag": "sha-0000000",
+      "CertificateArn": "",
+      "OrdersDesiredCount": "2",
+      "CatalogDesiredCount": "2",
+      "WorkerDesiredCount": "1",
+      "EnableAnalyticsConsumer": "false",
+      "KafkaBootstrapServers": "",
+      "RollbackAlarmNames": ""
+    },
+    "05-observability": {
+      "AlertEmail": "",
+      "OrdersP99LatencyThresholdSeconds": "1.0",
+      "Orders5xxPercentThreshold": "5",
+      "QueueAgeThresholdSeconds": "300",
+      "EventLogRetentionDays": "30"
+    },
+    "06-batch": {
+      "ImageTag": "sha-0000000",
+      "MaxvCpus": "16",
+      "ScheduleExpression": "cron(15 1 * * ? *)",
+      "ScheduleState": "DISABLED",
+      "UseSpot": "true"
+    }
+  }
+}

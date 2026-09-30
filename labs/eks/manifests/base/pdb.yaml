@@ -1,0 +1,49 @@
+# PodDisruptionBudgets bound voluntary disruptions: node drains during upgrades, Karpenter or Auto
+# Mode consolidation, `kubectl drain`. They do not slow a Deployment rollout (that is
+# maxUnavailable's job) and they do not stop involuntary loss (Spot reclaim, OOM). maxUnavailable
+# is safer than minAvailable when replicas change with the HPA: minAvailable: 1 with 1 replica
+# blocks every drain forever. hub/10 L200 §2.2.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: orders
+  namespace: shopfront
+  labels:
+    app.kubernetes.io/name: orders
+    app.kubernetes.io/part-of: shopfront
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: orders
+  unhealthyPodEvictionPolicy: AlwaysAllow   # do not let a CrashLooping pod block a node drain
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: catalog
+  namespace: shopfront
+  labels:
+    app.kubernetes.io/name: catalog
+    app.kubernetes.io/part-of: shopfront
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: catalog
+  unhealthyPodEvictionPolicy: AlwaysAllow
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: fulfillment-worker
+  namespace: shopfront
+  labels:
+    app.kubernetes.io/name: fulfillment-worker
+    app.kubernetes.io/part-of: shopfront
+spec:
+  maxUnavailable: 50%
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fulfillment-worker
+  unhealthyPodEvictionPolicy: AlwaysAllow

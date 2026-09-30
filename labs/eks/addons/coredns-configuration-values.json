@@ -1,0 +1,26 @@
+{
+  "_comment": "Configuration values for the CoreDNS managed add-on (hub/04 L200 s2.2, L300 s2.6). Apply with: aws eks update-addon --cluster-name shopfront-dev --addon-name coredns --configuration-values file://labs/eks/addons/coredns-configuration-values.json --resolve-conflicts PRESERVE. Add-on autoscaling replaces the cluster-proportional-autoscaler: EKS scales the Deployment between minReplicas and maxReplicas on node and core counts. The Corefile keeps the default plugins; `cache 30` and `prefer_udp` on the forward plugin cut the tail latency that ndots:5 causes; `log . { class error }` records failures without logging every query.",
+  "autoScaling": {
+    "enabled": true,
+    "minReplicas": 2,
+    "maxReplicas": 10
+  },
+  "replicaCount": 2,
+  "resources": {
+    "requests": { "cpu": "100m", "memory": "128Mi" },
+    "limits": { "memory": "256Mi" }
+  },
+  "podDisruptionBudget": {
+    "enabled": true,
+    "maxUnavailable": 1
+  },
+  "topologySpreadConstraints": [
+    {
+      "maxSkew": 1,
+      "topologyKey": "topology.kubernetes.io/zone",
+      "whenUnsatisfiable": "ScheduleAnyway",
+      "labelSelector": { "matchLabels": { "k8s-app": "kube-dns" } }
+    }
+  ],
+  "corefile": ".:53 {\n    errors\n    health {\n        lameduck 5s\n    }\n    ready\n    kubernetes cluster.local in-addr.arpa ip6.arpa {\n        pods insecure\n        fallthrough in-addr.arpa ip6.arpa\n        ttl 30\n    }\n    prometheus :9153\n    forward . /etc/resolv.conf {\n        max_concurrent 1000\n        prefer_udp\n    }\n    cache 30\n    loop\n    reload\n    loadbalance\n    log . {\n        class error\n    }\n}\n"
+}

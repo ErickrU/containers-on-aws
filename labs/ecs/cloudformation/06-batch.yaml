@@ -1,0 +1,256 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  shopfront batch layer: AWS Batch on Fargate (on-demand and Spot compute environments, one job
+  queue), the report-job job definition with the same hardening as the ECS task definitions,
+  an EventBridge Scheduler schedule that submits the daily report through the Batch SubmitJob
+  universal target, and an EventBridge rule that pages on FAILED jobs. See hub/09 L200 §2.6.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: shopfront
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  ImageTag:
+    Type: String
+    Default: sha-0000000
+    Description: Tag pushed by CI for the report-job image.
+  MaxvCpus:
+    Type: Number
+    Default: 16
+    Description: Upper bound of concurrent Fargate vCPUs per compute environment.
+  ScheduleExpression:
+    Type: String
+    Default: cron(15 1 * * ? *)
+    Description: When the daily report runs (UTC). Default 01:15 so the previous day is complete.
+  ScheduleState:
+    Type: String
+    Default: DISABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: Ship disabled; enable once the first manual submission succeeds.
+  UseSpot:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Add a Fargate Spot compute environment ahead of on-demand in the queue.
+
+Conditions:
+  Spot: !Equals [!Ref UseSpot, 'true']
+
+Resources:
+  # ------------------------------------------------------------------ compute environments ----
+  # Managed Fargate compute environments carry no instance settings: Batch sizes the Fargate task
+  # from the job definition's VCPU/MEMORY resource requirements. The service-linked role
+  # AWSServiceRoleForBatch is used when ServiceRole is omitted.
+  FargateComputeEnvironment:
+    Type: AWS::Batch::ComputeEnvironment
+    Properties:
+      ComputeEnvironmentName: !Sub '${ProjectName}-${Environment}-fargate'
+      Type: MANAGED
+      State: ENABLED
+      ComputeResources:
+        Type: FARGATE
+        MaxvCpus: !Ref MaxvCpus
+        Subnets: !Split
+          - ','
+          - !ImportValue
+            Fn::Sub: '${ProjectName}-${Environment}-PrivateSubnetIds'
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: '${ProjectName}-${Environment}-ServicesSecurityGroupId'
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  FargateSpotComputeEnvironment:
+    Type: AWS::Batch::ComputeEnvironment
+    Condition: Spot
+    Properties:
+      ComputeEnvironmentName: !Sub '${ProjectName}-${Environment}-fargate-spot'
+      Type: MANAGED
+      State: ENABLED
+      ComputeResources:
+        Type: FARGATE_SPOT
+        MaxvCpus: !Ref MaxvCpus
+        Subnets: !Split
+          - ','
+          - !ImportValue
+            Fn::Sub: '${ProjectName}-${Environment}-PrivateSubnetIds'
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: '${ProjectName}-${Environment}-ServicesSecurityGroupId'
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  # ------------------------------------------------------------------ job queue ---------------
+  # Spot first, on-demand second: a job that Spot cannot place within the scheduler's window is
+  # started on-demand instead of waiting. Retries (below) cover Spot interruptions.
+  ReportsJobQueue:
+    Type: AWS::Batch::JobQueue
+    Properties:
+      JobQueueName: !Sub '${ProjectName}-${Environment}-reports'
+      State: ENABLED
+      Priority: 10
+      ComputeEnvironmentOrder: !If
+        - Spot
+        - - { Order: 1, ComputeEnvironment: !Ref FargateSpotComputeEnvironment }
+          - { Order: 2, ComputeEnvironment: !Ref FargateComputeEnvironment }
+        - - { Order: 1, ComputeEnvironment: !Ref FargateComputeEnvironment }
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  # ------------------------------------------------------------------ job definition ----------
+  ReportJobDefinition:
+    Type: AWS::Batch::JobDefinition
+    Properties:
+      JobDefinitionName: !Sub '${ProjectName}-${Environment}-report-job'
+      Type: container
+      PlatformCapabilities: [FARGATE]
+      PropagateTags: true
+      # Two attempts: Spot reclaim or a transient database error gets one retry; an application
+      # error (exit code 1) does not, so a bug is not re-run against production data.
+      RetryStrategy:
+        Attempts: 2
+        EvaluateOnExit:
+          - { Action: RETRY, OnStatusReason: 'Host EC2*' }
+          - { Action: RETRY, OnReason: 'CannotPullContainerError*' }
+          - { Action: RETRY, OnExitCode: '137' }
+          - { Action: EXIT, OnExitCode: '1' }
+          - { Action: RETRY, OnReason: '*' }
+      Timeout:
+        AttemptDurationSeconds: 1800
+      ContainerProperties:
+        Image: !Sub
+          - '${Registry}/report-job:${ImageTag}'
+          - Registry: !ImportValue
+              Fn::Sub: '${ProjectName}-${Environment}-RegistryUri'
+        # No Command: the image ENTRYPOINT is `python /app/report.py`; REPORT_DATE can be passed
+        # as a container override at submit time (see labs/batch/submit-report.sh).
+        JobRoleArn: !ImportValue
+          Fn::Sub: '${ProjectName}-${Environment}-ReportJobTaskRoleArn'
+        ExecutionRoleArn: !ImportValue
+          Fn::Sub: '${ProjectName}-${Environment}-TaskExecutionRoleArn'
+        FargatePlatformConfiguration: { PlatformVersion: LATEST }
+        RuntimePlatform: { CpuArchitecture: ARM64, OperatingSystemFamily: LINUX }
+        NetworkConfiguration: { AssignPublicIp: DISABLED }
+        ResourceRequirements:
+          - { Type: VCPU, Value: '0.5' }
+          - { Type: MEMORY, Value: '1024' }
+        EphemeralStorage: { SizeInGiB: 21 }
+        Environment:
+          - { Name: AWS_REGION, Value: !Ref AWS::Region }
+          - Name: REPORT_OUTPUT
+            Value: !Sub
+              - 's3://${Bucket}/daily/'
+              - Bucket: !ImportValue
+                  Fn::Sub: '${ProjectName}-${Environment}-ReportsBucketName'
+          - { Name: OTEL_SDK_DISABLED, Value: 'true' }
+          - { Name: LOG_LEVEL, Value: INFO }
+        Secrets:
+          - Name: DATABASE_URL
+            ValueFrom: !ImportValue
+              Fn::Sub: '${ProjectName}-${Environment}-DatabaseUrlSecretArn'
+        User: '10001:10001'
+        ReadonlyRootFilesystem: true
+        LinuxParameters:
+          InitProcessEnabled: true
+        Volumes:
+          - { Name: tmp }
+        MountPoints:
+          - { SourceVolume: tmp, ContainerPath: /tmp, ReadOnly: false }
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group: !Sub '/${ProjectName}/${Environment}/report-job'
+            awslogs-region: !Ref AWS::Region
+            awslogs-stream-prefix: batch
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  # ------------------------------------------------------------------ schedule ----------------
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-report-scheduler'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { 'aws:SourceAccount': !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: submit-report-job
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: batch:SubmitJob
+                Resource:
+                  - !Ref ReportJobDefinition
+                  - !GetAtt ReportsJobQueue.JobQueueArn
+
+  # Universal target: EventBridge Scheduler calls the Batch SubmitJob API directly, so there is no
+  # Lambda between the clock and the job. The job name carries the scheduled time for traceability.
+  DailyReportSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-daily-report'
+      Description: Submits the shopfront daily report to AWS Batch.
+      State: !Ref ScheduleState
+      ScheduleExpression: !Ref ScheduleExpression
+      ScheduleExpressionTimezone: UTC
+      FlexibleTimeWindow: { Mode: 'OFF' }
+      Target:
+        Arn: !Sub 'arn:${AWS::Partition}:scheduler:::aws-sdk:batch:submitJob'
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: !Sub |
+          {
+            "JobName": "daily-report-<aws.scheduler.scheduled-time>",
+            "JobQueue": "${ReportsJobQueue.JobQueueArn}",
+            "JobDefinition": "${ReportJobDefinition}",
+            "Tags": { "Trigger": "schedule" }
+          }
+        RetryPolicy:
+          MaximumEventAgeInSeconds: 3600
+          MaximumRetryAttempts: 3
+
+  # ------------------------------------------------------------------ failure alerting --------
+  BatchJobFailedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-batch-job-failed'
+      Description: Page when a report job ends FAILED after its retries.
+      State: ENABLED
+      EventPattern:
+        source: [aws.batch]
+        detail-type: [Batch Job State Change]
+        detail:
+          status: [FAILED]
+          jobQueue: [!GetAtt ReportsJobQueue.JobQueueArn]
+      Targets:
+        - Id: alert-topic
+          Arn: !ImportValue
+            Fn::Sub: '${ProjectName}-${Environment}-AlertTopicArn'
+          InputTransformer:
+            InputPathsMap:
+              name: $.detail.jobName
+              reason: $.detail.statusReason
+            InputTemplate: '"Batch job <name> FAILED: <reason>"'
+
+Outputs:
+  JobQueueArn:
+    Value: !GetAtt ReportsJobQueue.JobQueueArn
+    Export: { Name: !Sub '${ProjectName}-${Environment}-ReportsJobQueueArn' }
+  JobDefinitionArn:
+    Value: !Ref ReportJobDefinition
+    Export: { Name: !Sub '${ProjectName}-${Environment}-ReportJobDefinitionArn' }
+  SubmitCommand:
+    Description: Manual run for the previous UTC day.
+    Value: !Sub 'aws batch submit-job --job-name manual-report --job-queue ${ReportsJobQueue.JobQueueArn} --job-definition ${ReportJobDefinition}'

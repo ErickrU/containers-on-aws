@@ -1,0 +1,97 @@
+# eksctl ClusterConfig for the shopfront lab on EKS Auto Mode (AWS manages the data plane).
+#
+#   eksctl create cluster -f labs/eks/cluster/eksctl-auto-mode.yaml     # ~12 min; nodes appear on first pod
+#   kubectl apply -f labs/eks/cluster/auto-mode-nodepool-nodeclass.yaml # optional custom NodePool/NodeClass
+#   eksctl delete cluster -f labs/eks/cluster/eksctl-auto-mode.yaml
+#
+# Differences from eksctl-standard.yaml (hub/04 L200 §2.7, L300 §2.6):
+#   - no managed node groups, no add-on list: compute (Karpenter), VPC CNI, CoreDNS, kube-proxy,
+#     EBS CSI, load balancing (ALB/NLB) and the Pod Identity agent are built-in capabilities that
+#     AWS runs and upgrades; you do not see them as pods and cannot change their flags.
+#   - nodes are Bottlerocket, replaced at most every 21 days, IMDS hop limit 1, no SSH/SSM shell.
+#   - the built-in NodePools `general-purpose` and `system` are enabled here; add your own with a
+#     NodeClass (subnets, security groups, ephemeral storage) when you need labels, taints or
+#     architecture constraints. The IngressClass is `alb` from the built-in controller (base/ingress.yaml
+#     uses IngressClassParams only on standard clusters; see overlays/dev).
+#   - a separate VPC CIDR so both clusters can exist in one account for comparison.
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: shopfront-dev-auto
+  region: us-east-1
+  version: "1.36"
+  tags:
+    Project: shopfront
+    Environment: dev
+    ManagedBy: containers-on-aws/labs
+
+autoModeConfig:
+  enabled: true
+  nodePools: [general-purpose, system]
+  # nodeRoleARN: arn:aws:iam::123456789012:role/shopfront-dev-auto-node   # eksctl creates one when omitted
+
+vpc:
+  cidr: 10.43.0.0/16
+  nat:
+    gateway: Single
+  clusterEndpoints:
+    publicAccess: true
+    privateAccess: true
+
+accessConfig:
+  authenticationMode: API
+  bootstrapClusterCreatorAdminPermissions: true
+
+cloudWatch:
+  clusterLogging:
+    enableTypes: [api, audit, authenticator, controllerManager, scheduler]
+    logRetentionInDays: 30
+
+iam:
+  withOIDC: true
+  podIdentityAssociations:
+    - namespace: shopfront
+      serviceAccountName: orders
+      roleName: shopfront-dev-auto-orders
+      permissionPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: [sqs:SendMessage, sqs:GetQueueAttributes]
+            Resource: arn:aws:sqs:us-east-1:123456789012:shopfront-dev-orders-created
+    - namespace: shopfront
+      serviceAccountName: fulfillment-worker
+      roleName: shopfront-dev-auto-fulfillment-worker
+      permissionPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:ChangeMessageVisibility, sqs:GetQueueAttributes]
+            Resource: arn:aws:sqs:us-east-1:123456789012:shopfront-dev-orders-created
+    - namespace: shopfront
+      serviceAccountName: report-job
+      roleName: shopfront-dev-auto-report-job
+      permissionPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: [s3:PutObject, s3:AbortMultipartUpload]
+            Resource: arn:aws:s3:::shopfront-reports-dev-123456789012/daily/*
+    - namespace: external-secrets
+      serviceAccountName: external-secrets
+      roleName: shopfront-dev-auto-external-secrets
+      permissionPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: [secretsmanager:GetSecretValue, secretsmanager:DescribeSecret]
+            Resource: arn:aws:secretsmanager:us-east-1:123456789012:secret:shopfront/*
+
+# Auto Mode still lets you install optional managed add-ons that are not built in.
+addons:
+  - name: metrics-server
+    version: latest
+  - name: amazon-cloudwatch-observability
+    version: latest
+    useDefaultPodIdentityAssociations: true

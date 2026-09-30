@@ -1,0 +1,122 @@
+# prod overlay: three replicas minimum, images by digest (immutable), TLS with the prod certificate,
+# WAF attached, prod endpoints, Kafka consumer on. Argo CD points the prod Application here.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+images:
+  - name: 123456789012.dkr.ecr.us-east-1.amazonaws.com/shopfront/orders
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+  - name: 123456789012.dkr.ecr.us-east-1.amazonaws.com/shopfront/catalog
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+  - name: 123456789012.dkr.ecr.us-east-1.amazonaws.com/shopfront/worker
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+  - name: 123456789012.dkr.ecr.us-east-1.amazonaws.com/shopfront/report-job
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+
+patches:
+  - target:
+      kind: Deployment
+      name: orders
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 3
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests: { cpu: 500m, memory: 512Mi }
+          limits: { memory: 768Mi }
+      - op: replace
+        path: /spec/template/spec/topologySpreadConstraints/0/whenUnsatisfiable
+        value: DoNotSchedule
+  - target:
+      kind: Deployment
+      name: catalog
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 3
+      - op: replace
+        path: /spec/template/spec/topologySpreadConstraints/0/whenUnsatisfiable
+        value: DoNotSchedule
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: orders
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 3
+      - op: replace
+        path: /spec/maxReplicas
+        value: 40
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: catalog
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 3
+      - op: replace
+        path: /spec/maxReplicas
+        value: 40
+  - target:
+      kind: ScaledObject
+      name: fulfillment-worker
+    patch: |-
+      - op: replace
+        path: /spec/minReplicaCount
+        value: 2
+      - op: replace
+        path: /spec/maxReplicaCount
+        value: 50
+  - target:
+      kind: Ingress
+      name: shopfront
+    patch: |-
+      - op: replace
+        path: /metadata/annotations/alb.ingress.kubernetes.io~1certificate-arn
+        value: arn:aws:acm:us-east-1:123456789012:certificate/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+      - op: add
+        path: /metadata/annotations/alb.ingress.kubernetes.io~1wafv2-acl-arn
+        value: arn:aws:wafv2:us-east-1:123456789012:regional/webacl/shopfront-prod/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+      - op: add
+        path: /metadata/annotations/alb.ingress.kubernetes.io~1shield-advanced-protection
+        value: "false"
+      - op: replace
+        path: /metadata/annotations/alb.ingress.kubernetes.io~1load-balancer-attributes
+        value: idle_timeout.timeout_seconds=60,routing.http.drop_invalid_header_fields.enabled=true,routing.http2.enabled=true,deletion_protection.enabled=true,access_logs.s3.enabled=true,access_logs.s3.bucket=shopfront-alb-logs-prod-123456789012
+      - op: replace
+        path: /metadata/annotations/alb.ingress.kubernetes.io~1tags
+        value: Project=shopfront,Environment=prod
+  - target:
+      kind: ConfigMap
+      name: shopfront-config
+    patch: |-
+      - op: replace
+        path: /data/SQS_QUEUE_URL
+        value: https://sqs.us-east-1.amazonaws.com/123456789012/shopfront-prod-orders-created
+      - op: replace
+        path: /data/VALKEY_URL
+        value: rediss://shopfront-prod-xxxxxx.serverless.use1.cache.amazonaws.com:6379
+      - op: replace
+        path: /data/KAFKA_BROKERS
+        value: boot-xxxxxxxx.c1.kafka-serverless.us-east-1.amazonaws.com:9098
+      - op: replace
+        path: /data/KAFKA_SASL_IAM
+        value: "true"
+      - op: replace
+        path: /data/OTEL_RESOURCE_ATTRIBUTES
+        value: deployment.environment=prod
+      - op: replace
+        path: /data/REPORT_OUTPUT
+        value: s3://shopfront-reports-prod-123456789012/daily/
+  - target:
+      kind: ExternalSecret
+      name: shopfront-db
+    patch: |-
+      - op: replace
+        path: /spec/data/0/remoteRef/key
+        value: shopfront/prod/database-url
